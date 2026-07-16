@@ -21,6 +21,9 @@ class SSHOperations {
   constructor(configPath, sshKeyPath) {
     this.config = {};
     this.sshKeyPath = sshKeyPath;
+    this.sshKey = null;
+    this.sshKeys = [];
+    this.preferredSSHKeyPaths = {};
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
@@ -86,36 +89,177 @@ class SSHOperations {
 
   async loadSSHKey() {
     log.debug('Loading SSH key');
-    
-    // First, try the explicitly configured path
+    const sshDir = path.join(os.homedir(), '.ssh');
+    const candidatePaths = [];
+
+    // First, try the explicitly configured path.
     if (this.sshKeyPath) {
-      try {
-        this.sshKey = await fs.readFile(this.sshKeyPath);
-        log.info(`Loaded SSH key from: ${this.sshKeyPath}`);
-        return;
-      } catch (error) {
-        log.debug(`Could not load SSH key from ${this.sshKeyPath}: ${error.message}`);
-      }
+      candidatePaths.push(this.sshKeyPath);
     }
 
-    // Fall back to searching common key locations
-    const sshDir = path.join(os.homedir(), '.ssh');
-    log.debug(`Searching for SSH keys in ${sshDir}`);
-    
+    // Then search common key locations, skipping duplicates.
     for (const keyName of SSH_KEY_CANDIDATES) {
       const keyPath = path.join(sshDir, keyName);
+      if (candidatePaths.includes(keyPath)) {
+        continue;
+      }
+      candidatePaths.push(keyPath);
+    }
+
+    log.debug(`Searching for SSH keys in ${sshDir}`);
+
+    this.sshKeys = [];
+    for (const keyPath of candidatePaths) {
       try {
-        this.sshKey = await fs.readFile(keyPath);
-        this.sshKeyPath = keyPath;
+        const key = await fs.readFile(keyPath);
+        this.sshKeys.push({ path: keyPath, key });
         log.info(`Loaded SSH key from: ${keyPath}`);
-        return;
       } catch (error) {
-        log.debug(`SSH key not found at ${keyPath}`);
+        log.debug(`Could not load SSH key from ${keyPath}: ${error.message}`);
       }
     }
 
-    const triedPaths = [this.sshKeyPath, ...SSH_KEY_CANDIDATES.map(k => path.join(sshDir, k))].filter(Boolean);
+    if (this.sshKeys.length > 0) {
+      this.sshKey = this.sshKeys[0].key;
+      this.sshKeyPath = this.sshKeys[0].path;
+      log.info(`Loaded ${this.sshKeys.length} SSH key(s); defaulting to ${this.sshKeyPath}`);
+      return;
+    }
+
+    this.sshKey = null;
+    const triedPaths = candidatePaths.filter(Boolean);
     log.error(`No valid SSH key found. Tried: ${triedPaths.join(', ')}`);
+  }
+
+  getAvailableSSHKeys(host = null) {
+    if (Array.isArray(this.sshKeys) && this.sshKeys.length > 0) {
+      const preferredPath = host ? this.preferredSSHKeyPaths[host] : null;
+      if (!preferredPath) {
+        return this.sshKeys;
+      }
+
+      const preferredKey = this.sshKeys.find((entry) => entry.path === preferredPath);
+      if (!preferredKey) {
+        return this.sshKeys;
+      }
+
+      return [
+        preferredKey,
+        ...this.sshKeys.filter((entry) => entry.path !== preferredPath)
+      ];
+    }
+    if (this.sshKey) {
+      return [{ path: this.sshKeyPath, key: this.sshKey }];
+    }
+    return [];
+  }
+
+  setPreferredSSHKey(host, authKey) {
+    if (!authKey || !authKey.path) {
+      return;
+    }
+
+    this.preferredSSHKeyPaths[host] = authKey.path;
+    this.sshKey = authKey.key;
+    this.sshKeyPath = authKey.path;
+
+    if (Array.isArray(this.sshKeys) && this.sshKeys.length > 0) {
+      this.sshKeys = [
+        authKey,
+        ...this.sshKeys.filter((entry) => entry.path !== authKey.path)
+      ];
+    }
+  }
+
+  isAuthenticationError(error) {
+    if (!error) {
+      return false;
+    }
+    return error.level === 'client-authentication' ||
+      /authentication methods failed|all configured authentication methods failed|permission denied/i.test(error.message || '');
+  }
+
+  connectWithKey(serverName, serverConfig, authKey, timeout = 0, extraOptions = {}) {
+    return new Promise((resolve, reject) => {
+      const conn = new Client();
+      let timer;
+      let settled = false;
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+      const finish = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+
+      conn.on('ready', () => {
+        log.debug(`${serverName}: Authenticated with SSH key ${authKey.path}`);
+        finish(resolve, conn);
+      }).on('error', (error) => {
+        error.sshKeyPath = authKey.path;
+        try {
+          conn.end();
+        } catch (_) {
+          // Ignore cleanup errors while switching to the next key.
+        }
+        finish(reject, error);
+      });
+
+      log.debug(`${serverName}: Trying SSH key ${authKey.path}`);
+      conn.connect({
+        host: serverConfig.host,
+        port: 22,
+        username: serverConfig.username,
+        privateKey: authKey.key,
+        ...extraOptions
+      });
+
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          const timeoutError = new Error(`SSH connection timed out after ${timeout}ms`);
+          timeoutError.code = 'ETIMEDOUT';
+          timeoutError.sshKeyPath = authKey.path;
+          conn.destroy();
+          finish(reject, timeoutError);
+        }, timeout);
+      }
+    });
+  }
+
+  async connectWithAvailableKeys(serverName, timeout = 0, extraOptions = {}) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) {
+      throw new Error(`Server not found: ${serverName}`);
+    }
+
+    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
+    if (authKeys.length === 0) {
+      throw new Error('No SSH key loaded');
+    }
+
+    let lastError = null;
+    for (const authKey of authKeys) {
+      try {
+        const conn = await this.connectWithKey(serverName, serverConfig, authKey, timeout, extraOptions);
+        this.setPreferredSSHKey(serverConfig.host, authKey);
+        return { conn, keyPath: authKey.path };
+      } catch (error) {
+        lastError = error;
+        if (!this.isAuthenticationError(error)) {
+          throw error;
+        }
+        log.debug(`${serverName}: Authentication failed with SSH key ${authKey.path}`);
+      }
+    }
+
+    throw lastError || new Error('All configured authentication methods failed');
   }
 
   setConfigPath(newPath) {
@@ -156,98 +300,57 @@ class SSHOperations {
   }
 
   async executeCommand(serverName, command, timeout = 0) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) {
+      log.error(`No config found for server: ${serverName}`);
+      return { success: false, sshDown: true };
+    }
+
+    if (this.getAvailableSSHKeys().length === 0) {
+      log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
+      return { success: false, sshDown: true, error: 'No SSH key loaded' };
+    }
+
+    log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, timeout));
+    } catch (error) {
+      log.error(`${serverName}: SSH connection error:`, error.message);
+      if (error.level) {
+        log.debug(`${serverName}: Error level: ${error.level}`);
+      }
+      return { success: false, sshDown: true, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const serverConfig = this.config[serverName];
-      if (!serverConfig) {
-        log.error(`No config found for server: ${serverName}`);
-        resolve({ success: false, sshDown: true });
-        return;
-      }
-
-      if (!this.sshKey) {
-        log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
-        resolve({ success: false, sshDown: true, error: 'No SSH key loaded' });
-        return;
-      }
-
-      log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
-
-      const conn = new Client();
-      let timer;
-      let settled = false;
-      const cleanup = () => {
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
+      conn.exec(command, (err, stream) => {
+        if (err) {
+          log.error(`${serverName}: Command execution failed:`, err.message);
+          conn.end();
+          resolve({ success: false, sshDown: true, error: err.message });
+          return;
         }
-      };
 
-      conn.on('ready', () => {
-        log.debug(`${serverName}: SSH connection ready`);
-        cleanup();
-        conn.exec(command, (err, stream) => {
-          if (err) {
-            log.error(`${serverName}: Command execution failed:`, err.message);
-            conn.end();
-            if (!settled) {
-              settled = true;
-              resolve({ success: false, sshDown: true });
-            }
-            return;
+        let output = '';
+        stream.on('close', (code, signal) => {
+          conn.end();
+          log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
+          // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
+          const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
+          if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+            log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
-
-          let output = '';
-          stream.on('close', (code, signal) => {
-            conn.end();
-            log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
-            // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
-            const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
-            if (code !== 0 && code !== null && !isScreenLsNoScreens) {
-              log.warn(`${serverName}: Command exited with non-zero code ${code}`);
-            }
-            if (!settled) {
-              settled = true;
-              resolve({ success: true, output, code, signal });
-            }
-            log.debug(`${serverName}: Output length: ${output.length} bytes`);
-          }).on('data', (data) => {
-            output += data;
-          }).stderr.on('data', (data) => {
-            output += data;
-            log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
-          });
+          resolve({ success: true, output, code, signal });
+          log.debug(`${serverName}: Output length: ${output.length} bytes`);
+        }).on('data', (data) => {
+          output += data;
+        }).stderr.on('data', (data) => {
+          output += data;
+          log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
         });
-      }).on('error', (err) => {
-        cleanup();
-        log.error(`${serverName}: SSH connection error:`, err.message);
-        if (err.level) {
-          log.debug(`${serverName}: Error level: ${err.level}`);
-        }
-        if (!settled) {
-          settled = true;
-          resolve({ success: false, sshDown: true });
-        }
       });
-
-      log.debug(`${serverName}: Connecting to ${serverConfig.host}:22 as ${serverConfig.username}`);
-      conn.connect({
-        host: serverConfig.host,
-        port: 22,
-        username: serverConfig.username,
-        privateKey: this.sshKey
-      });
-
-      if (timeout > 0) {
-        timer = setTimeout(() => {
-          log.warn(`${serverName}: SSH connection timed out after ${timeout}ms`);
-          conn.destroy();
-          cleanup();
-          if (!settled) {
-            settled = true;
-            resolve({ success: false, sshDown: true });
-          }
-        }, timeout);
-      }
     });
   }
 
@@ -639,92 +742,93 @@ class SSHOperations {
     return entry[1];
   }
 
+  getServerNameForHost(host) {
+    const entry = Object.entries(this.config).find(([, cfg]) => cfg.host === host);
+    return entry ? entry[0] : null;
+  }
+
   async readRemoteFile(host, remotePath) {
     const server = this.getServerForHost(host);
+    const serverName = this.getServerNameForHost(host);
     if (!server) {
       log.error(`Cannot read remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     log.info(`Reading remote file ${remotePath} from ${host}`);
-    
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, 5000));
+    } catch (error) {
+      log.error(`Connection error reading ${remotePath} on ${host}:`, error.message);
+      return { success: false, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const conn = new Client();
-      conn.on('ready', () => {
-        log.debug(`SFTP connection ready for ${host}`);
-        conn.sftp((err, sftp) => {
+      log.debug(`SFTP connection ready for ${host}`);
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          log.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
+          resolve({ success: false, error: err.message });
+          return;
+        }
+        sftp.readFile(remotePath, 'utf8', (err, data) => {
+          conn.end();
           if (err) {
-            conn.end();
-            log.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
+            log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
             resolve({ success: false, error: err.message });
-            return;
+          } else {
+            log.info(`Successfully read ${remotePath} from ${host} (${data.length} bytes)`);
+            resolve({ success: true, data });
           }
-          sftp.readFile(remotePath, 'utf8', (err, data) => {
-            conn.end();
-            if (err) {
-              log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
-              resolve({ success: false, error: err.message });
-            } else {
-              log.info(`Successfully read ${remotePath} from ${host} (${data.length} bytes)`);
-              resolve({ success: true, data });
-            }
-          });
         });
-      }).on('error', (err) => {
-        log.error(`Connection error reading ${remotePath} on ${host}:`, err.message);
-        resolve({ success: false, error: err.message });
-      }).connect({
-        host: server.host,
-        port: 22,
-        username: server.username,
-        privateKey: this.sshKey
       });
     });
   }
 
   async writeRemoteFile(host, remotePath, content) {
     const server = this.getServerForHost(host);
+    const serverName = this.getServerNameForHost(host);
     if (!server) {
       log.error(`Cannot write remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     log.info(`Writing remote file ${remotePath} to ${host}`);
-    
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, 5000));
+    } catch (error) {
+      log.error(`Connection error writing ${remotePath} on ${host}:`, error.message);
+      return { success: false, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const conn = new Client();
-      conn.on('ready', () => {
-        log.debug(`SFTP connection ready for ${host}`);
-        conn.sftp((err, sftp) => {
-          if (err) {
+      log.debug(`SFTP connection ready for ${host}`);
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          log.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
+          resolve({ success: false, error: err.message });
+          return;
+        }
+        const dir = path.posix.dirname(remotePath);
+        log.debug(`Creating directory ${dir} on ${host}`);
+        sftp.mkdir(dir, { mode: 0o755 }, () => {
+          sftp.writeFile(remotePath, content, 'utf8', (err2) => {
             conn.end();
-            log.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
-            resolve({ success: false, error: err.message });
-            return;
-          }
-          const dir = path.posix.dirname(remotePath);
-          log.debug(`Creating directory ${dir} on ${host}`);
-          sftp.mkdir(dir, { mode: 0o755 }, () => {
-            sftp.writeFile(remotePath, content, 'utf8', (err2) => {
-              conn.end();
-              if (err2) {
-                log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
-                resolve({ success: false, error: err2.message });
-              } else {
-                log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
-                resolve({ success: true });
-              }
-            });
+            if (err2) {
+              log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
+              resolve({ success: false, error: err2.message });
+            } else {
+              log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
+              resolve({ success: true });
+            }
           });
         });
-      }).on('error', (err) => {
-        log.error(`Connection error writing ${remotePath} on ${host}:`, err.message);
-        resolve({ success: false, error: err.message });
-      }).connect({
-        host: server.host,
-        port: 22,
-        username: server.username,
-        privateKey: this.sshKey
       });
     });
   }
