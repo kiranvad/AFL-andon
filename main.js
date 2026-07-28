@@ -3,7 +3,6 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const { createLogger, logFilePath } = require('./logger');
 const log = createLogger('main');
 
-const { Client } = require('ssh2');  // Correct import for ssh2
 const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
@@ -352,25 +351,15 @@ ipcMain.handle('start-ssh-session', async (event, serverName) => {
     return { success: false, error: 'Server not found' };
   }
   
-  const conn = new Client();
-
   try {
     log.debug(`start-ssh-session: Connecting to ${serverConfig.host} as ${serverConfig.username}`);
-    await new Promise((resolve, reject) => {
-      conn.on('ready', resolve);
-      conn.on('error', reject);
-      conn.connect({
-        host: serverConfig.host,
-        port: 22,
-        username: serverConfig.username,
-        privateKey: sshOps.sshKey,
-        pty: {
-          term: 'xterm'
-        }
-      });
+    const { conn, keyPath } = await sshOps.connectWithAvailableKeys(serverName, 5000, {
+      pty: {
+        term: 'xterm'
+      }
     });
 
-    log.debug(`start-ssh-session: SSH connection established for ${serverName}`);
+    log.debug(`start-ssh-session: SSH connection established for ${serverName} using ${keyPath}`);
     
     const stream = await new Promise((resolve, reject) => {
       conn.shell((err, stream) => {
