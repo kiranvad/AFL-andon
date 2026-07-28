@@ -11,12 +11,29 @@ running session for interactive commands.
 - Visual dashboard with per‑server status indicators
 - Start, stop and restart servers via SSH
 - View recent logs and join screen sessions in an integrated terminal
-- Batch status updates per host to reduce SSH connections
 - Add, edit or remove servers stored in `launchers.json`
 - Import configuration and SSH key files and set their paths
 - Edit local or remote AFL settings using a JSON editor
 - Webview tabs for interacting with each server’s web UI
 - Optional device server mode for simple up/down checks
+
+## Server Controls
+
+Each server card starts with red **SCREEN DOWN** and **SERVER DOWN** indicators.
+
+- **Start** launches the server over SSH, resets both indicators to red, and
+  then performs a status check. A live screen becomes green **SCREEN ACTIVE**;
+  a responding HTTP endpoint becomes green **SERVER UP**, **SERVER READY**, or
+  **SERVER BUSY**, depending on its queue-state response.
+- **Stop** sends the stop command and immediately leaves both indicators red.
+- **Restart** resets the indicators to red while it stops and starts the
+  server, then performs the same status check as **Start**.
+
+After a successful **Start** or **Restart**, Andon polls only that server for
+screen and queue state every 500 ms. Launchers not started by the current
+Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
+unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
+errors are written to the application terminal log rather than the card.
 
 ## Prerequisites
 
@@ -57,6 +74,16 @@ By default the app uses `~/.afl/launchers.json` for server definitions and
 variables or via `--config` and `--ssh-key` command‑line options.  The
 Settings tab also provides buttons to change them at runtime.
 
+The Settings tab reads and writes one current configuration file at
+`~/.afl/configs/andon.config.json` (or the same path on the selected remote
+host). It does not modify AFL-automation's global `~/.afl/config.json` or
+embed driver custom configurations; launcher entries reference those with a
+`driver_config_file` field instead.
+
+When a launcher successfully starts or stops, Andon rewrites its current entry
+in the file's `launchers` object with the launcher details, `runtime_state`,
+and `started_at` or `stopped_at` timestamp. It does not retain prior snapshots.
+
 ## Localhost SSH Setup
 
 If a server entry uses `localhost`, AFL Andon still manages it through SSH.
@@ -81,6 +108,38 @@ ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no localhost true
 
 If you prefer a different key, either update the command above or point the
 application at that key with `SERVER_CONTROL_SSH_KEY_PATH` or the Settings UI.
+
+## Tiled Server
+
+The repository includes a Tiled server configuration and launcher in `tiled/`.
+Start it with:
+
+```bash
+./tiled/start_tiled.sh
+```
+
+The script activates the `afl_agent` Conda environment by default; set
+`TILED_CONDA_ENV` to use a different one. The committed configuration contains
+no API key and permits anonymous read access. Configure credentials locally if
+your deployment requires authenticated writes.
+
+### Configure Tiled for Andon
+
+Keep deployment credentials out of this repository. Copy the `tiled/` folder
+to a private runtime location on the machine that will host Tiled, then edit
+that copy before starting it through Andon.
+
+1. Edit `start_tiled.sh` to use the correct Conda environment, or set
+   `TILED_CONDA_ENV` before running it. Confirm that the script and its
+   `tiled_config.yml` are in the intended runtime directory.
+2. Edit the copied `tiled_config.yml` if authenticated writes are required.
+   Set a local `single_user_api_key` value under `authentication`; do not add
+   that value to the repository or to `launchers.json`.
+3. In AFL-andon, create a Script launcher that points `Server Script` to the
+   copied `start_tiled.sh`. Use a unique screen name, set the HTTP port to
+   `8000`, and set `Status URL` to `http://<host>:8000/healthz`.
+4. Start the launcher from Andon. The server's logs remain available through
+   the **View Log** control.
 
 ## Building
 

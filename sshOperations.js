@@ -5,6 +5,7 @@ const os = require('os');
 const { createLogger } = require('./logger');
 
 const log = createLogger('ssh');
+const ANDON_CONFIG_FILENAME = 'andon.config.json';
 
 // Common SSH key filenames in order of preference (modern/secure first)
 // Based on OpenSSH default identity file search order
@@ -447,27 +448,20 @@ class SSHOperations {
     };
   }
 
-  async waitForServerHealth(serverName, attempts = 8) {
+  async waitForServerHealth(serverName, attempts = 20, intervalMs = 1000) {
     let lastResult;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       lastResult = await this.probeServerHealth(serverName);
       if (lastResult.ok) return lastResult;
-      if (attempt < attempts - 1) await sleep(750);
+      if (attempt < attempts - 1) await sleep(intervalMs);
     }
     return lastResult;
   }
 
   async ensureScreenDetached(serverName) {
     const screenName = this.config[serverName].screen_name;
-    const detachResult = await this.executeCommand(
-      serverName,
-      `screen -S ${shellQuote(screenName)} -d`,
-      5000
-    );
-    if (!detachResult.success || (detachResult.code !== 0 && detachResult.code !== null)) {
-      return { ok: false, reason: detachResult.error || detachResult.output || 'screen detach command failed' };
-    }
-
+    // startServer already launches screen with -d -m.  Asking screen to
+    // detach it again fails when it is already detached, so only verify it.
     const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
     if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
     const session = parseScreenSessions(statusResult.output)
@@ -563,7 +557,11 @@ class SSHOperations {
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
     }
     
-    const health = await this.waitForServerHealth(serverName);
+    const health = await this.waitForServerHealth(
+      serverName,
+      serverConfig.health_check_attempts || 20,
+      serverConfig.health_check_interval_ms || 1000
+    );
     if (!health.ok) {
       const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
       const error = `Server started but is not reachable at ${health.url}: ${reason}`;
@@ -574,6 +572,13 @@ class SSHOperations {
     const detached = await this.ensureScreenDetached(serverName);
     if (!detached.ok) {
       const error = `Server is reachable at ${health.url}, but its screen session could not be detached: ${detached.reason}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'running');
+    if (!runtimeConfig.success) {
+      const error = `Server started, but Andon runtime config could not be updated: ${runtimeConfig.error || 'unknown error'}`;
       log.error(`${serverName}: ${error}`);
       return { success: false, error, health };
     }
@@ -632,6 +637,11 @@ class SSHOperations {
     
     if (result.success) {
       log.info(`${serverName}: Server stopped successfully`);
+      const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
+      if (!runtimeConfig.success) {
+        log.error(`${serverName}: Andon runtime config could not be updated after stop: ${runtimeConfig.error || 'unknown error'}`);
+        return { success: false, error: runtimeConfig.error || 'Failed to update Andon runtime config' };
+      }
     } else {
       log.error(`${serverName}: Failed to stop server`);
     }
@@ -904,17 +914,20 @@ class SSHOperations {
           return;
         }
         const dir = path.posix.dirname(remotePath);
-        log.debug(`Creating directory ${dir} on ${host}`);
-        sftp.mkdir(dir, { mode: 0o755 }, () => {
-          sftp.writeFile(remotePath, content, 'utf8', (err2) => {
-            conn.end();
-            if (err2) {
-              log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
-              resolve({ success: false, error: err2.message });
-            } else {
-              log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
-              resolve({ success: true });
-            }
+        const parentDir = path.posix.dirname(dir);
+        log.debug(`Creating directories ${parentDir} and ${dir} on ${host}`);
+        sftp.mkdir(parentDir, { mode: 0o755 }, () => {
+          sftp.mkdir(dir, { mode: 0o755 }, () => {
+            sftp.writeFile(remotePath, content, 'utf8', (err2) => {
+              conn.end();
+              if (err2) {
+                log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
+                resolve({ success: false, error: err2.message });
+              } else {
+                log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
+                resolve({ success: true });
+              }
+              });
           });
         });
       });
@@ -924,24 +937,30 @@ class SSHOperations {
   async getRemoteAflConfig(host) {
     const server = this.getServerForHost(host);
     if (!server) {
-      log.error(`Cannot get AFL config: no server for host ${host}`);
+      log.error(`Cannot get Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     const homePath = await this.getRemoteHomePath(host, server.username);
-    const remotePath = `${homePath}/.afl/config.json`;
-    log.info(`Getting AFL config from ${host}: ${remotePath}`);
+    const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
+    log.info(`Getting Andon config from ${host}: ${remotePath}`);
     
     const res = await this.readRemoteFile(host, remotePath);
-    if (!res.success) return res;
+    if (!res.success) {
+      if (/no such file|enoent/i.test(res.error || '')) {
+        log.info(`No Andon config exists yet on ${host}`);
+        return { success: true, data: {} };
+      }
+      return res;
+    }
     
     try {
       const parsed = JSON.parse(res.data);
       const keyCount = Object.keys(parsed).length;
-      log.info(`Parsed AFL config from ${host}: ${keyCount} entries`);
+      log.info(`Parsed Andon config from ${host}: ${keyCount} entries`);
       return { success: true, data: parsed };
     } catch (parseError) {
-      log.warn(`Remote AFL config on ${host} is empty or invalid JSON: ${parseError.message}`);
+      log.warn(`Remote Andon config on ${host} is empty or invalid JSON: ${parseError.message}`);
       return { success: true, data: {} };
     }
   }
@@ -949,40 +968,45 @@ class SSHOperations {
   async saveRemoteAflConfig(host, cfgObj) {
     const server = this.getServerForHost(host);
     if (!server) {
-      log.error(`Cannot save AFL config: no server for host ${host}`);
+      log.error(`Cannot save Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     const homePath = await this.getRemoteHomePath(host, server.username);
-    const remotePath = `${homePath}/.afl/config.json`;
-    log.info(`Saving AFL config to ${remotePath} on ${host}`);
+    const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
+    log.info(`Saving Andon config to ${remotePath} on ${host}`);
     
-    let existing = {};
-    const read = await this.readRemoteFile(host, remotePath);
-    if (read.success && read.data) {
-      try { 
-        existing = JSON.parse(read.data);
-        log.debug(`Loaded existing config with ${Object.keys(existing).length} entries`);
-      } catch (e) {
-        log.debug(`Could not parse existing config: ${e.message}`);
-      }
-    }
-    
-    const now = new Date();
-    const pad = n => String(n).padStart(2, '0');
-    const micros = String(now.getMilliseconds() * 1000).padStart(6, '0');
-    const ts = `${String(now.getFullYear()).slice(-2)}/${pad(now.getDate())}/${pad(now.getMonth() + 1)} ` +
-               `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${micros}`;
-    
-    existing[ts] = cfgObj;
-    const content = JSON.stringify(existing, null, 2);
-    log.debug(`Saving config with timestamp ${ts}`);
+    const { driver_custom_configs, ...andonConfig } = cfgObj || {};
+    const content = JSON.stringify(andonConfig, null, 2);
     
     const res = await this.writeRemoteFile(host, remotePath, content);
     if (res.success) {
-      log.info(`AFL config saved successfully on ${host}`);
+      log.info(`Andon config saved successfully on ${host}`);
     }
     return res;
+  }
+
+  async updateAndonRuntimeConfig(serverName, state) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) return { success: false, error: 'Server not found' };
+
+    const host = serverConfig.host;
+    const current = await this.getRemoteAflConfig(host);
+    if (!current.success) return current;
+
+    const { driver_custom_configs, ...andonConfig } = current.data || {};
+    const launchers = andonConfig.launchers || {};
+    const previous = launchers[serverName] || {};
+    const timestamp = new Date().toISOString();
+    launchers[serverName] = {
+      ...previous,
+      ...serverConfig,
+      runtime_state: state,
+      ...(state === 'running' ? { started_at: timestamp } : { stopped_at: timestamp }),
+    };
+    andonConfig.launchers = launchers;
+
+    return this.saveRemoteAflConfig(host, andonConfig);
   }
 }
 

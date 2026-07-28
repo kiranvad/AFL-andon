@@ -10,6 +10,10 @@ const SSHOperations = require('./sshOperations');
 
 let mainWindow;
 let sshOps;
+const andonStartedServers = new Set();
+let shutdownPromise;
+let shutdownComplete = false;
+const andonConfigPath = path.join(os.homedir(), '.afl', 'configs', 'andon.config.json');
 
 const ICON_PATH_MAC = path.join(__dirname, 'assets', 'icons', 'mac', 'icon.icns');
 const ICON_PATH_PNG = path.join(__dirname, 'assets', 'icons', 'png', '256x256.png');
@@ -69,6 +73,29 @@ async function createWindow() {
   log.info('Main window created successfully');
 }
 
+async function stopManagedServersForShutdown() {
+  if (shutdownPromise) return shutdownPromise;
+
+  shutdownPromise = (async () => {
+    if (!sshOps) return;
+
+    const serverNames = [...andonStartedServers];
+    log.info(`Stopping ${serverNames.length} Andon-started server(s) before shutdown`);
+    const results = await Promise.allSettled(
+      serverNames.map(serverName => sshOps.stopServer(serverName))
+    );
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        log.error(`Shutdown: failed to stop ${serverNames[index]}:`, result.reason?.message || result.reason);
+      }
+    });
+  })().finally(() => {
+    shutdownComplete = true;
+  });
+
+  return shutdownPromise;
+}
+
 app.whenReady().then(async () => {
   log.info('Electron app ready');
   log.debug(`Process ID: ${process.pid}`);
@@ -99,12 +126,20 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('window-all-closed', () => {
+app.on('window-all-closed', async () => {
   log.info('All windows closed');
+  await stopManagedServersForShutdown();
   if (process.platform !== 'darwin') {
     log.info('Quitting application');
     app.quit();
   }
+});
+
+app.on('before-quit', (event) => {
+  if (shutdownComplete) return;
+
+  event.preventDefault();
+  stopManagedServersForShutdown().finally(() => app.quit());
 });
 
 app.on('activate', () => {
@@ -123,6 +158,11 @@ ipcMain.handle('start-server', async (event, serverName) => {
       log.warn(`start-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
+    if (!result.success) {
+      log.error(`start-server: ${serverName} failed to start: ${result.error || 'Unknown error'}`);
+      return result;
+    }
+    andonStartedServers.add(serverName);
     log.info(`start-server: ${serverName} started successfully`);
     return result;
   } catch (error) {
@@ -139,6 +179,7 @@ ipcMain.handle('stop-server', async (event, serverName) => {
       log.warn(`stop-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
+    if (result.success) andonStartedServers.delete(serverName);
     log.info(`stop-server: ${serverName} stopped successfully`);
     return result;
   } catch (error) {
@@ -155,6 +196,11 @@ ipcMain.handle('restart-server', async (event, serverName) => {
       log.warn(`restart-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
+    if (!result.success) {
+      log.error(`restart-server: ${serverName} failed to restart: ${result.error || 'Unknown error'}`);
+      return result;
+    }
+    andonStartedServers.add(serverName);
     log.info(`restart-server: ${serverName} restarted successfully`);
     return result;
   } catch (error) {
@@ -473,13 +519,17 @@ ipcMain.handle('get-afl-config', async (event, host) => {
     log.info(`get-afl-config: Successfully fetched from ${host}`);
     return { success: true, data: result.data };
   }
-  const cfgPath = path.join(os.homedir(), '.afl', 'config.json');
-  log.debug(`get-afl-config: Reading local config from ${cfgPath}`);
+  const cfgPath = andonConfigPath;
+  log.debug(`get-afl-config: Reading local Andon config from ${cfgPath}`);
   try {
     const data = await fs.readFile(cfgPath, 'utf8');
     log.info('get-afl-config: Local config loaded successfully');
     return { success: true, data: JSON.parse(data) };
   } catch (err) {
+    if (err.code === 'ENOENT') {
+      log.info('get-afl-config: No local Andon config exists yet');
+      return { success: true, data: {} };
+    }
     log.error('get-afl-config: Failed to read local config:', err.message);
     return { success: false, error: err.message };
   }
@@ -497,24 +547,12 @@ ipcMain.handle('save-afl-config', async (event, host, cfg) => {
     }
     return res;
   }
-  const cfgPath = path.join(os.homedir(), '.afl', 'config.json');
-  log.debug(`save-afl-config: Saving to local path ${cfgPath}`);
+  const cfgPath = andonConfigPath;
+  log.debug(`save-afl-config: Saving to local Andon config path ${cfgPath}`);
   try {
-    let data = {};
-    try {
-      const existing = await fs.readFile(cfgPath, 'utf8');
-      data = JSON.parse(existing);
-    } catch (_) {
-      log.debug('save-afl-config: No existing config, creating new');
-    }
-    const now = new Date();
-    const pad = n => String(n).padStart(2, '0');
-    const micros = String(now.getMilliseconds() * 1000).padStart(6, '0');
-    const ts = `${String(now.getFullYear()).slice(-2)}/${pad(now.getDate())}/${pad(now.getMonth() + 1)} ` +
-               `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${micros}`;
-    data[ts] = cfg;
+    const { driver_custom_configs, ...andonConfig } = cfg || {};
     await fs.mkdir(path.dirname(cfgPath), { recursive: true });
-    await fs.writeFile(cfgPath, JSON.stringify(data, null, 2));
+    await fs.writeFile(cfgPath, JSON.stringify(andonConfig, null, 2));
     log.info('save-afl-config: Local config saved successfully');
     return { success: true };
   } catch (err) {
