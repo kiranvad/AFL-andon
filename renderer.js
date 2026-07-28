@@ -246,7 +246,7 @@ async function fetchQueueState(serverName) {
   const serverConfig = config[serverName];
   if (!serverConfig) {
     log.warn(`No config for server ${serverName}`);
-    return { ok: false, state: null };
+    return { ok: false, state: null, reason: 'No server configuration is loaded' };
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
@@ -256,23 +256,35 @@ async function fetchQueueState(serverName) {
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
       log.debug(`${serverName}: HTTP ${response.status} from ${url}`);
-      return { ok: false, state: null };
+      return { ok: false, state: null, url, reason: `HTTP ${response.status} from ${url}` };
     }
     if (serverConfig.device) {
-      return { ok: true, state: null };
+      return { ok: true, state: null, url };
     }
     let state;
     try {
-      state = (await response.text()).trim();
+      const body = (await response.text()).trim();
+      // Health endpoints such as Tiled's return JSON (for example
+      // {"status":"ready"}), while AFL queue_state returns a plain string.
+      // Normalize both to the same state value so health JSON does not leave
+      // the server tab red or render as a raw JSON blob in the UI.
+      try {
+        const parsed = JSON.parse(body);
+        state = typeof parsed?.status === 'string' ? parsed.status : body;
+      } catch (_) {
+        state = body;
+      }
     } catch (_) {
       state = null;
     }
     log.debug(`${serverName}: Queue state = ${state || '(none)'}`);
-    return { ok: true, state };
+    return { ok: true, state, url };
   } catch (err) {
-    // Treat network errors (e.g., connection refused) as unreachable
-    log.debug(`${serverName}: Unreachable at ${url}`);
-    return { ok: false, state: null };
+    const reason = err?.name === 'AbortError'
+      ? `Timed out reaching ${url}`
+      : `Cannot reach ${url}: ${err?.message || 'connection failed'}`;
+    log.debug(`${serverName}: ${reason}`);
+    return { ok: false, state: null, url, reason };
   } finally {
     clearTimeout(timer);
   }
@@ -300,9 +312,14 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
     if (screenResult.sshDown) {
       screenStatusElement.textContent = 'SSH DOWN';
       screenStatusElement.className = 'status-indicator status-down';
+    } else if (screenResult.screenState === 'dead') {
+      screenStatusElement.textContent = 'SCREEN EXITED';
+      screenStatusElement.className = 'status-indicator status-down';
+      screenStatusElement.title = 'The screen session has exited; view the server log for the cause.';
     } else {
-      screenStatusElement.textContent = screenResult.status ? 'SCREEN ACTIVE' : 'SCREEN INACTIVE';
+      screenStatusElement.textContent = screenResult.status ? 'SCREEN ACTIVE' : 'SCREEN NOT RUNNING';
       screenStatusElement.className = `status-indicator ${screenResult.status ? 'status-up' : 'status-down'}`;
+      screenStatusElement.title = screenResult.status ? '' : 'No live screen session was found.';
     }
   }
   
@@ -313,8 +330,11 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
       httpStatusElement.textContent = text;
       httpStatusElement.className = 'status-indicator status-up';
     } else {
-      httpStatusElement.textContent = 'UNREACHABLE';
+      httpStatusElement.textContent = queueResult.reason
+        ? `UNREACHABLE: ${queueResult.reason}`
+        : 'UNREACHABLE';
       httpStatusElement.className = 'status-indicator status-down';
+      httpStatusElement.title = queueResult.reason || '';
     }
   }
 
@@ -364,7 +384,10 @@ async function batchUpdateServerStatuses() {
             const screenStatus = {
               success: true,
               status: sessions.includes(serverConfig.screen_name),
-              sshDown: false
+              sshDown: false,
+              screenState: batchResult.sessionDetails?.find(
+                session => session.name === serverConfig.screen_name
+              )?.state || 'missing'
             };
 
             // Fetch queue state for each server individually

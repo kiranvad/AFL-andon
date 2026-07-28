@@ -17,6 +17,29 @@ const SSH_KEY_CANDIDATES = [
   'id_dsa',          // DSA - deprecated but may still exist
 ];
 
+const sleep = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+// `screen -ls` retains exited sessions until `screen -wipe` is run. Keep
+// those entries separate so a stale record is never reported as a live server.
+function parseScreenSessions(output) {
+  const sessions = [];
+  for (const line of output.split('\n')) {
+    const match = line.match(/\d+\.([^\s\t]+)/);
+    if (!match || !match[1]) continue;
+
+    let state = 'unknown';
+    if (/\(Dead/i.test(line)) state = 'dead';
+    else if (/\(Detached\)/i.test(line)) state = 'detached';
+    else if (/\(Attached\)/i.test(line)) state = 'attached';
+    sessions.push({ name: match[1], state, line: line.trim() });
+  }
+  return sessions;
+}
+
 class SSHOperations {
   constructor(configPath, sshKeyPath) {
     this.config = {};
@@ -399,6 +422,61 @@ class SSHOperations {
     return homePath;
   }
 
+  getStatusUrl(serverName) {
+    const serverConfig = this.config[serverName];
+    return serverConfig.status_url ||
+      `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
+  }
+
+  async probeServerHealth(serverName) {
+    const url = this.getStatusUrl(serverName);
+    const command = `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(url)}`;
+    const result = await this.executeCommand(serverName, command, 5000);
+    if (!result.success) return { ok: false, url, reason: result.error || 'SSH connection failed' };
+
+    const statusCode = (result.output || '').trim().match(/\d{3}$/)?.[0] || null;
+    if (result.code === 0 && statusCode && Number(statusCode) >= 200 && Number(statusCode) < 300) {
+      return { ok: true, url, statusCode: Number(statusCode) };
+    }
+    const detail = (result.output || '').trim().replace(/\d{3}$/, '').trim();
+    return {
+      ok: false,
+      url,
+      statusCode: statusCode ? Number(statusCode) : null,
+      reason: detail || (statusCode ? `HTTP ${statusCode}` : 'connection failed')
+    };
+  }
+
+  async waitForServerHealth(serverName, attempts = 8) {
+    let lastResult;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      lastResult = await this.probeServerHealth(serverName);
+      if (lastResult.ok) return lastResult;
+      if (attempt < attempts - 1) await sleep(750);
+    }
+    return lastResult;
+  }
+
+  async ensureScreenDetached(serverName) {
+    const screenName = this.config[serverName].screen_name;
+    const detachResult = await this.executeCommand(
+      serverName,
+      `screen -S ${shellQuote(screenName)} -d`,
+      5000
+    );
+    if (!detachResult.success || (detachResult.code !== 0 && detachResult.code !== null)) {
+      return { ok: false, reason: detachResult.error || detachResult.output || 'screen detach command failed' };
+    }
+
+    const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
+    if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
+    const session = parseScreenSessions(statusResult.output)
+      .find(item => item.name === screenName && item.state !== 'dead');
+    if (!session) return { ok: false, reason: `screen session "${screenName}" exited` };
+    if (session.state !== 'detached') return { ok: false, reason: `screen session is ${session.state}, not detached` };
+    return { ok: true };
+  }
+
   async startServer(serverName) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
@@ -485,8 +563,23 @@ class SSHOperations {
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
     }
     
-    log.info(`${serverName}: Server started successfully`);
-    return result;
+    const health = await this.waitForServerHealth(serverName);
+    if (!health.ok) {
+      const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
+      const error = `Server started but is not reachable at ${health.url}: ${reason}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    const detached = await this.ensureScreenDetached(serverName);
+    if (!detached.ok) {
+      const error = `Server is reachable at ${health.url}, but its screen session could not be detached: ${detached.reason}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    log.info(`${serverName}: Server started, passed health check, and is detached`);
+    return { ...result, health };
   }
 
   async stopServer(serverName) {
@@ -581,10 +674,12 @@ class SSHOperations {
     
     if (cachedData && (now - cachedData.timestamp) < 5000) { // Cache valid for 5 seconds
       const status = cachedData.sessions.includes(serverConfig.screen_name);
+      const matchingSession = cachedData.sessionDetails?.find(session => session.name === serverConfig.screen_name);
       log.debug(`${serverName}: Using cached status: ${status} (cache age: ${now - cachedData.timestamp}ms)`);
       return {
         success: true,
-        status: status
+        status: status,
+        screenState: matchingSession?.state || 'missing'
       };
     }
     
@@ -601,21 +696,17 @@ class SSHOperations {
       this.screenSessionCache = {};
     }
     
-    // Extract all session names from the screen -ls output
-    const screenSessions = [];
-    const lines = result.output.split('\n');
-    for (const line of lines) {
-      // Look for lines containing screen session info
-      const match = line.match(/\d+\.([^\s\t]+)/); // Extracts session name
-      if (match && match[1]) {
-        screenSessions.push(match[1]);
-      }
-    }
+    const sessionDetails = parseScreenSessions(result.output);
+    const screenSessions = sessionDetails
+      .filter(session => session.state !== 'dead')
+      .map(session => session.name);
+    const matchingSession = sessionDetails.find(session => session.name === serverConfig.screen_name);
     
     // Cache the results
     this.screenSessionCache[host] = {
       timestamp: now,
-      sessions: screenSessions
+      sessions: screenSessions,
+      sessionDetails
     };
 
     log.debug(`${serverName}: Found ${screenSessions.length} sessions on ${host}: ${screenSessions.join(', ') || '(none)'}`);
@@ -625,7 +716,8 @@ class SSHOperations {
     
     return {
       success: true,
-      status: status
+      status: status,
+      screenState: matchingSession?.state || 'missing'
     };
   }
 
@@ -650,15 +742,10 @@ class SSHOperations {
       return { success: false, sshDown: true, host };
     }
     
-    // Extract all session names from the screen -ls output
-    const screenSessions = [];
-    const lines = result.output.split('\n');
-    for (const line of lines) {
-      const match = line.match(/\d+\.([^\s\t]+)/); // Extracts session name
-      if (match && match[1]) {
-        screenSessions.push(match[1]);
-      }
-    }
+    const sessionDetails = parseScreenSessions(result.output);
+    const screenSessions = sessionDetails
+      .filter(session => session.state !== 'dead')
+      .map(session => session.name);
     
     // Cache the results
     const now = Date.now();
@@ -667,12 +754,13 @@ class SSHOperations {
     }
     this.screenSessionCache[host] = {
       timestamp: now,
-      sessions: screenSessions
+      sessions: screenSessions,
+      sessionDetails
     };
     
     log.debug(`Host ${host}: Found ${screenSessions.length} screen sessions: ${screenSessions.join(', ') || '(none)'}`);
     
-    return { success: true, host, sessions: screenSessions };
+    return { success: true, host, sessions: screenSessions, sessionDetails };
   }
   
   // Group all servers by host for efficient batch checking
