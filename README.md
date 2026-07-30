@@ -77,8 +77,7 @@ Settings tab also provides buttons to change them at runtime.
 The Settings tab reads and writes one current configuration file at
 `~/.afl/configs/andon.config.json` (or the same path on the selected remote
 host). It does not modify AFL-automation's global `~/.afl/config.json` or
-embed driver custom configurations; launcher entries reference those with a
-`driver_config_file` field instead.
+embed driver custom configurations.
 
 When a launcher successfully starts or stops, Andon rewrites its current entry
 in the file's `launchers` object with the launcher details, `runtime_state`,

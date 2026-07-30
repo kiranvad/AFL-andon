@@ -692,7 +692,6 @@ function openServerModal(serverName = null) {
     form.elements['server-type'].value = server.server_script ? 'script' : 'module';
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
-    form.elements['driver-config-file'].value = server.driver_config_file || '';
     form.elements['server-shell'].value = server.shell || 'bash';
     form.elements['server-env-type'].value = server.env_type || (server.conda_env ? 'conda' : 'pip');
     form.elements['server-conda-env'].value = server.conda_env || '';
@@ -711,7 +710,6 @@ function openServerModal(serverName = null) {
     form.elements['server-device'].checked = false;
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
-    form.elements['driver-config-file'].value = '';
     form.elements['server-active'].checked = true;
     form.elements['server-env-type'].value = 'conda';
   }
@@ -755,9 +753,6 @@ async function handleServerFormSubmit(event) {
   } else {
     serverConfig.server_module = form.elements['server-module'].value;
   }
-
-  const driverConfigFile = form.elements['driver-config-file'].value.trim();
-  if (driverConfigFile) serverConfig.driver_config_file = driverConfigFile;
 
   const envType = form.elements['server-env-type'].value;
   serverConfig.env_type = envType;
