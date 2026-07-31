@@ -26,29 +26,13 @@ let aflConfig = {};
 let aflConfigEditor;
 let selectedAflHost = null;
 
-function parseAflTimestamp(key) {
-  try {
-    const [datePart, timePart] = key.split(' ');
-    const [yearPart, dd, mm] = datePart.split('/').map(Number);
-    const [hh, mi, secPart] = timePart.split(':');
-    const ss = Number(secPart.split('.')[0]);
-    // Handle both 2-digit (YY) and 4-digit (YYYY) year formats
-    const year = yearPart < 100 ? 2000 + yearPart : yearPart;
-    const timestamp = new Date(year, mm - 1, dd, Number(hh), Number(mi), ss).getTime();
-    log.debug(`Parsed timestamp "${key}" -> ${new Date(timestamp).toISOString()}`);
-    return timestamp;
-  } catch (e) {
-    log.warn(`Failed to parse timestamp "${key}": ${e.message}`);
-    return 0;
-  }
-}
-
 let sshStream;
 
 let terminal;
 let currentServerName;
 let activeTab = null;
 let inactiveExpanded = false;
+const startedServers = new Set();
 
 async function joinServer(serverName) {
   log.info(`Joining server: ${serverName}`);
@@ -161,23 +145,8 @@ async function loadAflConfig() {
     alert(`Failed to load config: ${result.error}`);
     return;
   }
-  const fullCfg = result.data || {};
-  const keys = Object.keys(fullCfg);
-  log.info(`AFL config has ${keys.length} entries: ${keys.join(', ')}`);
-  
-  let latestKey = null;
-  let latestTimestamp = 0;
-  keys.forEach(k => {
-    const ts = parseAflTimestamp(k);
-    log.debug(`Entry "${k}" parsed to timestamp ${ts} (${new Date(ts).toISOString()})`);
-    if (ts > latestTimestamp) {
-      latestTimestamp = ts;
-      latestKey = k;
-    }
-  });
-  
-  aflConfig = latestKey ? fullCfg[latestKey] : {};
-  log.info(`AFL config loaded, selected latest key: "${latestKey || '(none)'}" with timestamp ${latestTimestamp}`);
+  aflConfig = result.data || {};
+  log.info(`Loaded current Andon config with ${Object.keys(aflConfig).length} entries`);
   renderAflConfigEditor();
 }
 
@@ -246,7 +215,7 @@ async function fetchQueueState(serverName) {
   const serverConfig = config[serverName];
   if (!serverConfig) {
     log.warn(`No config for server ${serverName}`);
-    return { ok: false, state: null };
+    return { ok: false, state: null, reason: 'No server configuration is loaded' };
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
@@ -255,24 +224,37 @@ async function fetchQueueState(serverName) {
   try {
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
-      log.debug(`${serverName}: HTTP ${response.status} from ${url}`);
-      return { ok: false, state: null };
+      const reason = `HTTP ${response.status} from ${url}`;
+      log.warn(`${serverName}: ${reason}`);
+      return { ok: false, state: null, url, reason };
     }
     if (serverConfig.device) {
-      return { ok: true, state: null };
+      return { ok: true, state: null, url };
     }
     let state;
     try {
-      state = (await response.text()).trim();
+      const body = (await response.text()).trim();
+      // Health endpoints such as Tiled's return JSON (for example
+      // {"status":"ready"}), while AFL queue_state returns a plain string.
+      // Normalize both to the same state value so health JSON does not leave
+      // the server tab red or render as a raw JSON blob in the UI.
+      try {
+        const parsed = JSON.parse(body);
+        state = typeof parsed?.status === 'string' ? parsed.status : body;
+      } catch (_) {
+        state = body;
+      }
     } catch (_) {
       state = null;
     }
     log.debug(`${serverName}: Queue state = ${state || '(none)'}`);
-    return { ok: true, state };
+    return { ok: true, state, url };
   } catch (err) {
-    // Treat network errors (e.g., connection refused) as unreachable
-    log.debug(`${serverName}: Unreachable at ${url}`);
-    return { ok: false, state: null };
+    const reason = err?.name === 'AbortError'
+      ? `Timed out reaching ${url}`
+      : `Cannot reach ${url}: ${err?.message || 'connection failed'}`;
+    log.warn(`${serverName}: ${reason}`);
+    return { ok: false, state: null, url, reason };
   } finally {
     clearTimeout(timer);
   }
@@ -300,43 +282,66 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
     if (screenResult.sshDown) {
       screenStatusElement.textContent = 'SSH DOWN';
       screenStatusElement.className = 'status-indicator status-down';
+    } else if (screenResult.screenState === 'dead') {
+      screenStatusElement.textContent = 'SCREEN EXITED';
+      screenStatusElement.className = 'status-indicator status-down';
+      screenStatusElement.title = 'The screen session has exited; view the server log for the cause.';
     } else {
-      screenStatusElement.textContent = screenResult.status ? 'SCREEN ACTIVE' : 'SCREEN INACTIVE';
+      screenStatusElement.textContent = screenResult.status ? 'SCREEN ACTIVE' : 'SCREEN DOWN';
       screenStatusElement.className = `status-indicator ${screenResult.status ? 'status-up' : 'status-down'}`;
+      screenStatusElement.title = screenResult.status ? '' : 'No live screen session was found.';
     }
   }
   
   if (httpStatusElement) {
     if (queueResult.ok) {
       const serverCfg = config[serverName] || {};
-      const text = serverCfg.device ? 'UP' : queueResult.state;
-      httpStatusElement.textContent = text;
+      const state = typeof queueResult.state === 'string' ? queueResult.state.trim() : '';
+      httpStatusElement.textContent = serverCfg.device || !state
+        ? 'SERVER UP'
+        : `SERVER ${state.toUpperCase()}`;
       httpStatusElement.className = 'status-indicator status-up';
     } else {
       httpStatusElement.textContent = 'UNREACHABLE';
       httpStatusElement.className = 'status-indicator status-down';
+      httpStatusElement.title = '';
     }
   }
 
   updateTabStatus(serverName, queueResult);
 }
 
+function showServerDownStatus(serverName) {
+  const screenStatusElement = document.getElementById(`${serverName}-screen-status`);
+  const httpStatusElement = document.getElementById(`${serverName}-http-status`);
+  if (screenStatusElement) {
+    screenStatusElement.textContent = 'SCREEN DOWN';
+    screenStatusElement.className = 'status-indicator status-down';
+    screenStatusElement.title = '';
+  }
+  if (httpStatusElement) {
+    httpStatusElement.textContent = 'SERVER DOWN';
+    httpStatusElement.className = 'status-indicator status-down';
+    httpStatusElement.title = '';
+  }
+}
+
 // Batch update server statuses by host
 async function batchUpdateServerStatuses() {
   try {
-    // Get servers grouped by host, *but keep only active servers*.
+    // Get servers grouped by host, keeping only servers started by this
+    // Andon session. This avoids probing launchers that have not been started.
     const allByHost   = await ipcRenderer.invoke('get-servers-by-host');
-    const activeByHost = {};
+    const startedByHost = {};
 
     for (const [host, names] of Object.entries(allByHost)) {
-      const activeNames = names.filter(name => config[name] && config[name].active);
-      if (activeNames.length) activeByHost[host] = activeNames;
+      const startedNames = names.filter(name => startedServers.has(name));
+      if (startedNames.length) startedByHost[host] = startedNames;
     }
-    // Nothing active?  Just bail out early.
-    if (Object.keys(activeByHost).length === 0) return;
+    if (Object.keys(startedByHost).length === 0) return;
 
     await Promise.all(
-      Object.entries(activeByHost).map(async ([host, servers]) => {
+      Object.entries(startedByHost).map(async ([host, servers]) => {
         const batchResult = await ipcRenderer.invoke(
           'get-batch-server-status',
           host
@@ -364,7 +369,10 @@ async function batchUpdateServerStatuses() {
             const screenStatus = {
               success: true,
               status: sessions.includes(serverConfig.screen_name),
-              sshDown: false
+              sshDown: false,
+              screenState: batchResult.sessionDetails?.find(
+                session => session.name === serverConfig.screen_name
+              )?.state || 'missing'
             };
 
             // Fetch queue state for each server individually
@@ -389,6 +397,7 @@ async function batchUpdateServerStatuses() {
 
 async function controlServer(serverName, action) {
   log.info(`Controlling server ${serverName}: ${action}`);
+  showServerDownStatus(serverName);
   try {
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
     if (result.success) {
@@ -398,7 +407,11 @@ async function controlServer(serverName, action) {
     } else {
       log.error(`${action} failed for ${serverName}:`, result.error || 'Unknown error');
     }
-    updateServerStatus(serverName);
+    if (result.success && (action === 'start' || action === 'restart')) {
+      startedServers.add(serverName);
+      await updateServerStatus(serverName);
+    }
+    if (result.success && action === 'stop') startedServers.delete(serverName);
   } catch (error) {
     log.error(`Error during ${action} for ${serverName}:`, error.message);
   }
@@ -619,12 +632,14 @@ function createServerControls(serverName) {
 
   const screenStatusElement = document.createElement('span');
   screenStatusElement.id = `${serverName}-screen-status`;
-  screenStatusElement.className = 'status-indicator';
+  screenStatusElement.textContent = 'SCREEN DOWN';
+  screenStatusElement.className = 'status-indicator status-down';
   statusContainer.appendChild(screenStatusElement);
 
   const httpStatusElement = document.createElement('span');
   httpStatusElement.id = `${serverName}-http-status`;
-  httpStatusElement.className = 'status-indicator';
+  httpStatusElement.textContent = 'SERVER DOWN';
+  httpStatusElement.className = 'status-indicator status-down';
   statusContainer.appendChild(httpStatusElement);
 
   container.appendChild(statusContainer);
@@ -860,8 +875,6 @@ function renderServers() {
 
   log.info(`Rendered ${activeCount} active servers, ${inactiveServers.length} inactive`);
 
-  // Update all server statuses
-  sortedServers.forEach(updateServerStatus);
 }
 
 // Function to toggle inactive servers visibility
@@ -1020,19 +1033,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       closeTerminalModal();
     }
   }
-  
+
   let statusJobRunning = false;
 
-  log.info('Starting status update interval (500ms)');
+  log.info('Starting status update interval for Andon-started servers (500ms)');
   setInterval(async () => {
-    if (statusJobRunning || !config) return;
+    if (statusJobRunning || !config || startedServers.size === 0) return;
     statusJobRunning = true;
     try {
       await batchUpdateServerStatuses();
     } finally {
       statusJobRunning = false;
     }
-  }, 500);   // 500 ms interval
+  }, 500);
   
   log.info('UI initialization complete');
 });

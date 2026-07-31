@@ -5,6 +5,7 @@ const os = require('os');
 const { createLogger } = require('./logger');
 
 const log = createLogger('ssh');
+const ANDON_CONFIG_FILENAME = 'andon.config.json';
 
 // Common SSH key filenames in order of preference (modern/secure first)
 // Based on OpenSSH default identity file search order
@@ -17,10 +18,36 @@ const SSH_KEY_CANDIDATES = [
   'id_dsa',          // DSA - deprecated but may still exist
 ];
 
+const sleep = (milliseconds) => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+// `screen -ls` retains exited sessions until `screen -wipe` is run. Keep
+// those entries separate so a stale record is never reported as a live server.
+function parseScreenSessions(output) {
+  const sessions = [];
+  for (const line of output.split('\n')) {
+    const match = line.match(/\d+\.([^\s\t]+)/);
+    if (!match || !match[1]) continue;
+
+    let state = 'unknown';
+    if (/\(Dead/i.test(line)) state = 'dead';
+    else if (/\(Detached\)/i.test(line)) state = 'detached';
+    else if (/\(Attached\)/i.test(line)) state = 'attached';
+    sessions.push({ name: match[1], state, line: line.trim() });
+  }
+  return sessions;
+}
+
 class SSHOperations {
   constructor(configPath, sshKeyPath) {
     this.config = {};
     this.sshKeyPath = sshKeyPath;
+    this.sshKey = null;
+    this.sshKeys = [];
+    this.preferredSSHKeyPaths = {};
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
@@ -86,36 +113,177 @@ class SSHOperations {
 
   async loadSSHKey() {
     log.debug('Loading SSH key');
-    
-    // First, try the explicitly configured path
+    const sshDir = path.join(os.homedir(), '.ssh');
+    const candidatePaths = [];
+
+    // First, try the explicitly configured path.
     if (this.sshKeyPath) {
-      try {
-        this.sshKey = await fs.readFile(this.sshKeyPath);
-        log.info(`Loaded SSH key from: ${this.sshKeyPath}`);
-        return;
-      } catch (error) {
-        log.debug(`Could not load SSH key from ${this.sshKeyPath}: ${error.message}`);
-      }
+      candidatePaths.push(this.sshKeyPath);
     }
 
-    // Fall back to searching common key locations
-    const sshDir = path.join(os.homedir(), '.ssh');
-    log.debug(`Searching for SSH keys in ${sshDir}`);
-    
+    // Then search common key locations, skipping duplicates.
     for (const keyName of SSH_KEY_CANDIDATES) {
       const keyPath = path.join(sshDir, keyName);
+      if (candidatePaths.includes(keyPath)) {
+        continue;
+      }
+      candidatePaths.push(keyPath);
+    }
+
+    log.debug(`Searching for SSH keys in ${sshDir}`);
+
+    this.sshKeys = [];
+    for (const keyPath of candidatePaths) {
       try {
-        this.sshKey = await fs.readFile(keyPath);
-        this.sshKeyPath = keyPath;
+        const key = await fs.readFile(keyPath);
+        this.sshKeys.push({ path: keyPath, key });
         log.info(`Loaded SSH key from: ${keyPath}`);
-        return;
       } catch (error) {
-        log.debug(`SSH key not found at ${keyPath}`);
+        log.debug(`Could not load SSH key from ${keyPath}: ${error.message}`);
       }
     }
 
-    const triedPaths = [this.sshKeyPath, ...SSH_KEY_CANDIDATES.map(k => path.join(sshDir, k))].filter(Boolean);
+    if (this.sshKeys.length > 0) {
+      this.sshKey = this.sshKeys[0].key;
+      this.sshKeyPath = this.sshKeys[0].path;
+      log.info(`Loaded ${this.sshKeys.length} SSH key(s); defaulting to ${this.sshKeyPath}`);
+      return;
+    }
+
+    this.sshKey = null;
+    const triedPaths = candidatePaths.filter(Boolean);
     log.error(`No valid SSH key found. Tried: ${triedPaths.join(', ')}`);
+  }
+
+  getAvailableSSHKeys(host = null) {
+    if (Array.isArray(this.sshKeys) && this.sshKeys.length > 0) {
+      const preferredPath = host ? this.preferredSSHKeyPaths[host] : null;
+      if (!preferredPath) {
+        return this.sshKeys;
+      }
+
+      const preferredKey = this.sshKeys.find((entry) => entry.path === preferredPath);
+      if (!preferredKey) {
+        return this.sshKeys;
+      }
+
+      return [
+        preferredKey,
+        ...this.sshKeys.filter((entry) => entry.path !== preferredPath)
+      ];
+    }
+    if (this.sshKey) {
+      return [{ path: this.sshKeyPath, key: this.sshKey }];
+    }
+    return [];
+  }
+
+  setPreferredSSHKey(host, authKey) {
+    if (!authKey || !authKey.path) {
+      return;
+    }
+
+    this.preferredSSHKeyPaths[host] = authKey.path;
+    this.sshKey = authKey.key;
+    this.sshKeyPath = authKey.path;
+
+    if (Array.isArray(this.sshKeys) && this.sshKeys.length > 0) {
+      this.sshKeys = [
+        authKey,
+        ...this.sshKeys.filter((entry) => entry.path !== authKey.path)
+      ];
+    }
+  }
+
+  isAuthenticationError(error) {
+    if (!error) {
+      return false;
+    }
+    return error.level === 'client-authentication' ||
+      /authentication methods failed|all configured authentication methods failed|permission denied/i.test(error.message || '');
+  }
+
+  connectWithKey(serverName, serverConfig, authKey, timeout = 0, extraOptions = {}) {
+    return new Promise((resolve, reject) => {
+      const conn = new Client();
+      let timer;
+      let settled = false;
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+      const finish = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+
+      conn.on('ready', () => {
+        log.debug(`${serverName}: Authenticated with SSH key ${authKey.path}`);
+        finish(resolve, conn);
+      }).on('error', (error) => {
+        error.sshKeyPath = authKey.path;
+        try {
+          conn.end();
+        } catch (_) {
+          // Ignore cleanup errors while switching to the next key.
+        }
+        finish(reject, error);
+      });
+
+      log.debug(`${serverName}: Trying SSH key ${authKey.path}`);
+      conn.connect({
+        host: serverConfig.host,
+        port: 22,
+        username: serverConfig.username,
+        privateKey: authKey.key,
+        ...extraOptions
+      });
+
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          const timeoutError = new Error(`SSH connection timed out after ${timeout}ms`);
+          timeoutError.code = 'ETIMEDOUT';
+          timeoutError.sshKeyPath = authKey.path;
+          conn.destroy();
+          finish(reject, timeoutError);
+        }, timeout);
+      }
+    });
+  }
+
+  async connectWithAvailableKeys(serverName, timeout = 0, extraOptions = {}) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) {
+      throw new Error(`Server not found: ${serverName}`);
+    }
+
+    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
+    if (authKeys.length === 0) {
+      throw new Error('No SSH key loaded');
+    }
+
+    let lastError = null;
+    for (const authKey of authKeys) {
+      try {
+        const conn = await this.connectWithKey(serverName, serverConfig, authKey, timeout, extraOptions);
+        this.setPreferredSSHKey(serverConfig.host, authKey);
+        return { conn, keyPath: authKey.path };
+      } catch (error) {
+        lastError = error;
+        if (!this.isAuthenticationError(error)) {
+          throw error;
+        }
+        log.debug(`${serverName}: Authentication failed with SSH key ${authKey.path}`);
+      }
+    }
+
+    throw lastError || new Error('All configured authentication methods failed');
   }
 
   setConfigPath(newPath) {
@@ -156,98 +324,57 @@ class SSHOperations {
   }
 
   async executeCommand(serverName, command, timeout = 0) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) {
+      log.error(`No config found for server: ${serverName}`);
+      return { success: false, sshDown: true };
+    }
+
+    if (this.getAvailableSSHKeys().length === 0) {
+      log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
+      return { success: false, sshDown: true, error: 'No SSH key loaded' };
+    }
+
+    log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, timeout));
+    } catch (error) {
+      log.error(`${serverName}: SSH connection error:`, error.message);
+      if (error.level) {
+        log.debug(`${serverName}: Error level: ${error.level}`);
+      }
+      return { success: false, sshDown: true, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const serverConfig = this.config[serverName];
-      if (!serverConfig) {
-        log.error(`No config found for server: ${serverName}`);
-        resolve({ success: false, sshDown: true });
-        return;
-      }
-
-      if (!this.sshKey) {
-        log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
-        resolve({ success: false, sshDown: true, error: 'No SSH key loaded' });
-        return;
-      }
-
-      log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
-
-      const conn = new Client();
-      let timer;
-      let settled = false;
-      const cleanup = () => {
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
+      conn.exec(command, (err, stream) => {
+        if (err) {
+          log.error(`${serverName}: Command execution failed:`, err.message);
+          conn.end();
+          resolve({ success: false, sshDown: true, error: err.message });
+          return;
         }
-      };
 
-      conn.on('ready', () => {
-        log.debug(`${serverName}: SSH connection ready`);
-        cleanup();
-        conn.exec(command, (err, stream) => {
-          if (err) {
-            log.error(`${serverName}: Command execution failed:`, err.message);
-            conn.end();
-            if (!settled) {
-              settled = true;
-              resolve({ success: false, sshDown: true });
-            }
-            return;
+        let output = '';
+        stream.on('close', (code, signal) => {
+          conn.end();
+          log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
+          // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
+          const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
+          if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+            log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
-
-          let output = '';
-          stream.on('close', (code, signal) => {
-            conn.end();
-            log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
-            // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
-            const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
-            if (code !== 0 && code !== null && !isScreenLsNoScreens) {
-              log.warn(`${serverName}: Command exited with non-zero code ${code}`);
-            }
-            if (!settled) {
-              settled = true;
-              resolve({ success: true, output, code, signal });
-            }
-            log.debug(`${serverName}: Output length: ${output.length} bytes`);
-          }).on('data', (data) => {
-            output += data;
-          }).stderr.on('data', (data) => {
-            output += data;
-            log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
-          });
+          resolve({ success: true, output, code, signal });
+          log.debug(`${serverName}: Output length: ${output.length} bytes`);
+        }).on('data', (data) => {
+          output += data;
+        }).stderr.on('data', (data) => {
+          output += data;
+          log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
         });
-      }).on('error', (err) => {
-        cleanup();
-        log.error(`${serverName}: SSH connection error:`, err.message);
-        if (err.level) {
-          log.debug(`${serverName}: Error level: ${err.level}`);
-        }
-        if (!settled) {
-          settled = true;
-          resolve({ success: false, sshDown: true });
-        }
       });
-
-      log.debug(`${serverName}: Connecting to ${serverConfig.host}:22 as ${serverConfig.username}`);
-      conn.connect({
-        host: serverConfig.host,
-        port: 22,
-        username: serverConfig.username,
-        privateKey: this.sshKey
-      });
-
-      if (timeout > 0) {
-        timer = setTimeout(() => {
-          log.warn(`${serverName}: SSH connection timed out after ${timeout}ms`);
-          conn.destroy();
-          cleanup();
-          if (!settled) {
-            settled = true;
-            resolve({ success: false, sshDown: true });
-          }
-        }, timeout);
-      }
     });
   }
 
@@ -294,6 +421,54 @@ class SSHOperations {
     const homePath = remoteOs === 'darwin' ? `/Users/${username}` : `/home/${username}`;
     log.debug(`Home path for ${username}@${host} (${remoteOs}): ${homePath}`);
     return homePath;
+  }
+
+  getStatusUrl(serverName) {
+    const serverConfig = this.config[serverName];
+    return serverConfig.status_url ||
+      `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
+  }
+
+  async probeServerHealth(serverName) {
+    const url = this.getStatusUrl(serverName);
+    const command = `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(url)}`;
+    const result = await this.executeCommand(serverName, command, 5000);
+    if (!result.success) return { ok: false, url, reason: result.error || 'SSH connection failed' };
+
+    const statusCode = (result.output || '').trim().match(/\d{3}$/)?.[0] || null;
+    if (result.code === 0 && statusCode && Number(statusCode) >= 200 && Number(statusCode) < 300) {
+      return { ok: true, url, statusCode: Number(statusCode) };
+    }
+    const detail = (result.output || '').trim().replace(/\d{3}$/, '').trim();
+    return {
+      ok: false,
+      url,
+      statusCode: statusCode ? Number(statusCode) : null,
+      reason: detail || (statusCode ? `HTTP ${statusCode}` : 'connection failed')
+    };
+  }
+
+  async waitForServerHealth(serverName, attempts = 20, intervalMs = 1000) {
+    let lastResult;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      lastResult = await this.probeServerHealth(serverName);
+      if (lastResult.ok) return lastResult;
+      if (attempt < attempts - 1) await sleep(intervalMs);
+    }
+    return lastResult;
+  }
+
+  async ensureScreenDetached(serverName) {
+    const screenName = this.config[serverName].screen_name;
+    // startServer already launches screen with -d -m.  Asking screen to
+    // detach it again fails when it is already detached, so only verify it.
+    const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
+    if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
+    const session = parseScreenSessions(statusResult.output)
+      .find(item => item.name === screenName && item.state !== 'dead');
+    if (!session) return { ok: false, reason: `screen session "${screenName}" exited` };
+    if (session.state !== 'detached') return { ok: false, reason: `screen session is ${session.state}, not detached` };
+    return { ok: true };
   }
 
   async startServer(serverName) {
@@ -382,8 +557,34 @@ class SSHOperations {
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
     }
     
-    log.info(`${serverName}: Server started successfully`);
-    return result;
+    const health = await this.waitForServerHealth(
+      serverName,
+      serverConfig.health_check_attempts || 20,
+      serverConfig.health_check_interval_ms || 1000
+    );
+    if (!health.ok) {
+      const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
+      const error = `Server started but is not reachable at ${health.url}: ${reason}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    const detached = await this.ensureScreenDetached(serverName);
+    if (!detached.ok) {
+      const error = `Server is reachable at ${health.url}, but its screen session could not be detached: ${detached.reason}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'running');
+    if (!runtimeConfig.success) {
+      const error = `Server started, but Andon runtime config could not be updated: ${runtimeConfig.error || 'unknown error'}`;
+      log.error(`${serverName}: ${error}`);
+      return { success: false, error, health };
+    }
+
+    log.info(`${serverName}: Server started, passed health check, and is detached`);
+    return { ...result, health };
   }
 
   async stopServer(serverName) {
@@ -436,6 +637,11 @@ class SSHOperations {
     
     if (result.success) {
       log.info(`${serverName}: Server stopped successfully`);
+      const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
+      if (!runtimeConfig.success) {
+        log.error(`${serverName}: Andon runtime config could not be updated after stop: ${runtimeConfig.error || 'unknown error'}`);
+        return { success: false, error: runtimeConfig.error || 'Failed to update Andon runtime config' };
+      }
     } else {
       log.error(`${serverName}: Failed to stop server`);
     }
@@ -478,10 +684,12 @@ class SSHOperations {
     
     if (cachedData && (now - cachedData.timestamp) < 5000) { // Cache valid for 5 seconds
       const status = cachedData.sessions.includes(serverConfig.screen_name);
+      const matchingSession = cachedData.sessionDetails?.find(session => session.name === serverConfig.screen_name);
       log.debug(`${serverName}: Using cached status: ${status} (cache age: ${now - cachedData.timestamp}ms)`);
       return {
         success: true,
-        status: status
+        status: status,
+        screenState: matchingSession?.state || 'missing'
       };
     }
     
@@ -498,21 +706,17 @@ class SSHOperations {
       this.screenSessionCache = {};
     }
     
-    // Extract all session names from the screen -ls output
-    const screenSessions = [];
-    const lines = result.output.split('\n');
-    for (const line of lines) {
-      // Look for lines containing screen session info
-      const match = line.match(/\d+\.([^\s\t]+)/); // Extracts session name
-      if (match && match[1]) {
-        screenSessions.push(match[1]);
-      }
-    }
+    const sessionDetails = parseScreenSessions(result.output);
+    const screenSessions = sessionDetails
+      .filter(session => session.state !== 'dead')
+      .map(session => session.name);
+    const matchingSession = sessionDetails.find(session => session.name === serverConfig.screen_name);
     
     // Cache the results
     this.screenSessionCache[host] = {
       timestamp: now,
-      sessions: screenSessions
+      sessions: screenSessions,
+      sessionDetails
     };
 
     log.debug(`${serverName}: Found ${screenSessions.length} sessions on ${host}: ${screenSessions.join(', ') || '(none)'}`);
@@ -522,7 +726,8 @@ class SSHOperations {
     
     return {
       success: true,
-      status: status
+      status: status,
+      screenState: matchingSession?.state || 'missing'
     };
   }
 
@@ -547,15 +752,10 @@ class SSHOperations {
       return { success: false, sshDown: true, host };
     }
     
-    // Extract all session names from the screen -ls output
-    const screenSessions = [];
-    const lines = result.output.split('\n');
-    for (const line of lines) {
-      const match = line.match(/\d+\.([^\s\t]+)/); // Extracts session name
-      if (match && match[1]) {
-        screenSessions.push(match[1]);
-      }
-    }
+    const sessionDetails = parseScreenSessions(result.output);
+    const screenSessions = sessionDetails
+      .filter(session => session.state !== 'dead')
+      .map(session => session.name);
     
     // Cache the results
     const now = Date.now();
@@ -564,12 +764,13 @@ class SSHOperations {
     }
     this.screenSessionCache[host] = {
       timestamp: now,
-      sessions: screenSessions
+      sessions: screenSessions,
+      sessionDetails
     };
     
     log.debug(`Host ${host}: Found ${screenSessions.length} screen sessions: ${screenSessions.join(', ') || '(none)'}`);
     
-    return { success: true, host, sessions: screenSessions };
+    return { success: true, host, sessions: screenSessions, sessionDetails };
   }
   
   // Group all servers by host for efficient batch checking
@@ -639,71 +840,83 @@ class SSHOperations {
     return entry[1];
   }
 
+  getServerNameForHost(host) {
+    const entry = Object.entries(this.config).find(([, cfg]) => cfg.host === host);
+    return entry ? entry[0] : null;
+  }
+
   async readRemoteFile(host, remotePath) {
     const server = this.getServerForHost(host);
+    const serverName = this.getServerNameForHost(host);
     if (!server) {
       log.error(`Cannot read remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     log.info(`Reading remote file ${remotePath} from ${host}`);
-    
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, 5000));
+    } catch (error) {
+      log.error(`Connection error reading ${remotePath} on ${host}:`, error.message);
+      return { success: false, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const conn = new Client();
-      conn.on('ready', () => {
-        log.debug(`SFTP connection ready for ${host}`);
-        conn.sftp((err, sftp) => {
+      log.debug(`SFTP connection ready for ${host}`);
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          log.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
+          resolve({ success: false, error: err.message });
+          return;
+        }
+        sftp.readFile(remotePath, 'utf8', (err, data) => {
+          conn.end();
           if (err) {
-            conn.end();
-            log.error(`SFTP error reading ${remotePath} on ${host}:`, err.message);
+            log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
             resolve({ success: false, error: err.message });
-            return;
+          } else {
+            log.info(`Successfully read ${remotePath} from ${host} (${data.length} bytes)`);
+            resolve({ success: true, data });
           }
-          sftp.readFile(remotePath, 'utf8', (err, data) => {
-            conn.end();
-            if (err) {
-              log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
-              resolve({ success: false, error: err.message });
-            } else {
-              log.info(`Successfully read ${remotePath} from ${host} (${data.length} bytes)`);
-              resolve({ success: true, data });
-            }
-          });
         });
-      }).on('error', (err) => {
-        log.error(`Connection error reading ${remotePath} on ${host}:`, err.message);
-        resolve({ success: false, error: err.message });
-      }).connect({
-        host: server.host,
-        port: 22,
-        username: server.username,
-        privateKey: this.sshKey
       });
     });
   }
 
   async writeRemoteFile(host, remotePath, content) {
     const server = this.getServerForHost(host);
+    const serverName = this.getServerNameForHost(host);
     if (!server) {
       log.error(`Cannot write remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     log.info(`Writing remote file ${remotePath} to ${host}`);
-    
+
+    let conn;
+    try {
+      ({ conn } = await this.connectWithAvailableKeys(serverName, 5000));
+    } catch (error) {
+      log.error(`Connection error writing ${remotePath} on ${host}:`, error.message);
+      return { success: false, error: error.message };
+    }
+
     return new Promise((resolve) => {
-      const conn = new Client();
-      conn.on('ready', () => {
-        log.debug(`SFTP connection ready for ${host}`);
-        conn.sftp((err, sftp) => {
-          if (err) {
-            conn.end();
-            log.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
-            resolve({ success: false, error: err.message });
-            return;
-          }
-          const dir = path.posix.dirname(remotePath);
-          log.debug(`Creating directory ${dir} on ${host}`);
+      log.debug(`SFTP connection ready for ${host}`);
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          log.error(`SFTP error writing ${remotePath} on ${host}:`, err.message);
+          resolve({ success: false, error: err.message });
+          return;
+        }
+        const dir = path.posix.dirname(remotePath);
+        const parentDir = path.posix.dirname(dir);
+        log.debug(`Creating directories ${parentDir} and ${dir} on ${host}`);
+        sftp.mkdir(parentDir, { mode: 0o755 }, () => {
           sftp.mkdir(dir, { mode: 0o755 }, () => {
             sftp.writeFile(remotePath, content, 'utf8', (err2) => {
               conn.end();
@@ -714,17 +927,9 @@ class SSHOperations {
                 log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
                 resolve({ success: true });
               }
-            });
+              });
           });
         });
-      }).on('error', (err) => {
-        log.error(`Connection error writing ${remotePath} on ${host}:`, err.message);
-        resolve({ success: false, error: err.message });
-      }).connect({
-        host: server.host,
-        port: 22,
-        username: server.username,
-        privateKey: this.sshKey
       });
     });
   }
@@ -732,24 +937,30 @@ class SSHOperations {
   async getRemoteAflConfig(host) {
     const server = this.getServerForHost(host);
     if (!server) {
-      log.error(`Cannot get AFL config: no server for host ${host}`);
+      log.error(`Cannot get Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     const homePath = await this.getRemoteHomePath(host, server.username);
-    const remotePath = `${homePath}/.afl/config.json`;
-    log.info(`Getting AFL config from ${host}: ${remotePath}`);
+    const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
+    log.info(`Getting Andon config from ${host}: ${remotePath}`);
     
     const res = await this.readRemoteFile(host, remotePath);
-    if (!res.success) return res;
+    if (!res.success) {
+      if (/no such file|enoent/i.test(res.error || '')) {
+        log.info(`No Andon config exists yet on ${host}`);
+        return { success: true, data: {} };
+      }
+      return res;
+    }
     
     try {
       const parsed = JSON.parse(res.data);
       const keyCount = Object.keys(parsed).length;
-      log.info(`Parsed AFL config from ${host}: ${keyCount} entries`);
+      log.info(`Parsed Andon config from ${host}: ${keyCount} entries`);
       return { success: true, data: parsed };
     } catch (parseError) {
-      log.warn(`Remote AFL config on ${host} is empty or invalid JSON: ${parseError.message}`);
+      log.warn(`Remote Andon config on ${host} is empty or invalid JSON: ${parseError.message}`);
       return { success: true, data: {} };
     }
   }
@@ -757,40 +968,45 @@ class SSHOperations {
   async saveRemoteAflConfig(host, cfgObj) {
     const server = this.getServerForHost(host);
     if (!server) {
-      log.error(`Cannot save AFL config: no server for host ${host}`);
+      log.error(`Cannot save Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
     const homePath = await this.getRemoteHomePath(host, server.username);
-    const remotePath = `${homePath}/.afl/config.json`;
-    log.info(`Saving AFL config to ${remotePath} on ${host}`);
+    const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
+    log.info(`Saving Andon config to ${remotePath} on ${host}`);
     
-    let existing = {};
-    const read = await this.readRemoteFile(host, remotePath);
-    if (read.success && read.data) {
-      try { 
-        existing = JSON.parse(read.data);
-        log.debug(`Loaded existing config with ${Object.keys(existing).length} entries`);
-      } catch (e) {
-        log.debug(`Could not parse existing config: ${e.message}`);
-      }
-    }
-    
-    const now = new Date();
-    const pad = n => String(n).padStart(2, '0');
-    const micros = String(now.getMilliseconds() * 1000).padStart(6, '0');
-    const ts = `${String(now.getFullYear()).slice(-2)}/${pad(now.getDate())}/${pad(now.getMonth() + 1)} ` +
-               `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${micros}`;
-    
-    existing[ts] = cfgObj;
-    const content = JSON.stringify(existing, null, 2);
-    log.debug(`Saving config with timestamp ${ts}`);
+    const { driver_custom_configs, ...andonConfig } = cfgObj || {};
+    const content = JSON.stringify(andonConfig, null, 2);
     
     const res = await this.writeRemoteFile(host, remotePath, content);
     if (res.success) {
-      log.info(`AFL config saved successfully on ${host}`);
+      log.info(`Andon config saved successfully on ${host}`);
     }
     return res;
+  }
+
+  async updateAndonRuntimeConfig(serverName, state) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) return { success: false, error: 'Server not found' };
+
+    const host = serverConfig.host;
+    const current = await this.getRemoteAflConfig(host);
+    if (!current.success) return current;
+
+    const { driver_custom_configs, ...andonConfig } = current.data || {};
+    const launchers = andonConfig.launchers || {};
+    const previous = launchers[serverName] || {};
+    const timestamp = new Date().toISOString();
+    launchers[serverName] = {
+      ...previous,
+      ...serverConfig,
+      runtime_state: state,
+      ...(state === 'running' ? { started_at: timestamp } : { stopped_at: timestamp }),
+    };
+    andonConfig.launchers = launchers;
+
+    return this.saveRemoteAflConfig(host, andonConfig);
   }
 }
 
