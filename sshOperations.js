@@ -24,6 +24,14 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
+function isLocalHost(host) {
+  const normalized = String(host || '').trim().toLowerCase();
+  return normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '[::1]';
+}
+
 // `screen -ls` retains exited sessions until `screen -wipe` is run. Keep
 // those entries separate so a stale record is never reported as a live server.
 function parseScreenSessions(output) {
@@ -471,6 +479,41 @@ class SSHOperations {
     return { ok: true };
   }
 
+  async resolveModuleConfigPath(serverName, serverConfig) {
+    const localPath = serverConfig.config_file_location?.trim();
+    if (!localPath) return { success: true, configPath: null };
+
+    let content;
+    try {
+      content = await fs.readFile(localPath, 'utf8');
+    } catch (error) {
+      const message = error.code === 'ENOENT'
+        ? `Config file does not exist on this computer: ${localPath}`
+        : `Could not read config file ${localPath}: ${error.message}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+
+    if (isLocalHost(serverConfig.host)) {
+      log.debug(`${serverName}: Using local config file ${localPath}`);
+      return { success: true, configPath: localPath };
+    }
+
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
+    const extension = path.extname(localPath);
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const remotePath = `${homePath}/.afl/configs/${safeServerName}.launch-config${extension}`;
+    const upload = await this.writeRemoteFile(serverConfig.host, remotePath, content);
+    if (!upload.success) {
+      const message = `Could not copy config file to ${serverConfig.host}: ${upload.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+
+    log.info(`${serverName}: Copied local config file to ${remotePath}`);
+    return { success: true, configPath: remotePath };
+  }
+
   async startServer(serverName) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
@@ -478,6 +521,13 @@ class SSHOperations {
     if (!serverConfig) {
       log.error(`Cannot start server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+
+    let moduleConfigPath = null;
+    if (serverConfig.server_module) {
+      const configResult = await this.resolveModuleConfigPath(serverName, serverConfig);
+      if (!configResult.success) return configResult;
+      moduleConfigPath = configResult.configPath;
     }
     
     // Detect remote OS to use appropriate screen options
@@ -504,6 +554,10 @@ class SSHOperations {
 
     if (serverConfig.server_module) {
       let command = `python -m ${serverConfig.server_module}`;
+      if (moduleConfigPath) {
+        command += ` --config ${shellQuote(moduleConfigPath)}`;
+        log.debug(`${serverName}: Using config file ${moduleConfigPath}`);
+      }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
       
       // Handle environment activation based on env_type
@@ -520,7 +574,7 @@ class SSHOperations {
         command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
       }
       
-      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci "${command}"`;
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci ${shellQuote(command)}`;
     } else if (serverConfig.server_script) {
       log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
       if (isMacOs) {

@@ -83,6 +83,13 @@ When a launcher successfully starts or stops, Andon rewrites its current entry
 in the file's `launchers` object with the launcher details, `runtime_state`,
 and `started_at` or `stopped_at` timestamp. It does not retain prior snapshots.
 
+For a Module launcher, **Config file location** is a path on the computer
+running Andon. Andon verifies it before start. For a remote host, Andon copies
+the file to `~/.afl/configs/` on that host and starts the module with
+`--config` pointing to the copied file. For `localhost`, Andon uses the local
+path directly. Leaving the field empty preserves the module's default
+persistent configuration behavior.
+
 ## Localhost SSH Setup
 
 If a server entry uses `localhost`, AFL Andon still manages it through SSH.

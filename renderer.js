@@ -692,6 +692,7 @@ function openServerModal(serverName = null) {
     form.elements['server-type'].value = server.server_script ? 'script' : 'module';
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
+    form.elements['server-config-file-location'].value = server.config_file_location || '';
     form.elements['server-shell'].value = server.shell || 'bash';
     form.elements['server-env-type'].value = server.env_type || (server.conda_env ? 'conda' : 'pip');
     form.elements['server-conda-env'].value = server.conda_env || '';
@@ -710,6 +711,7 @@ function openServerModal(serverName = null) {
     form.elements['server-device'].checked = false;
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
+    form.elements['server-config-file-location'].value = '';
     form.elements['server-active'].checked = true;
     form.elements['server-env-type'].value = 'conda';
   }
@@ -753,6 +755,9 @@ async function handleServerFormSubmit(event) {
   } else {
     serverConfig.server_module = form.elements['server-module'].value;
   }
+
+  // Keep an empty value so an edit can explicitly clear a prior selection.
+  serverConfig.config_file_location = form.elements['server-config-file-location'].value.trim();
 
   const envType = form.elements['server-env-type'].value;
   serverConfig.env_type = envType;
