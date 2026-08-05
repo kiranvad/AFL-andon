@@ -468,13 +468,44 @@ class SSHOperations {
 
   async ensureScreenDetached(serverName) {
     const screenName = this.config[serverName].screen_name;
-    // startServer already launches screen with -d -m.  Asking screen to
-    // detach it again fails when it is already detached, so only verify it.
-    const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
-    if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
-    const session = parseScreenSessions(statusResult.output)
-      .find(item => item.name === screenName && item.state !== 'dead');
+    const getSession = async () => {
+      const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
+      if (!statusResult.success) {
+        return { error: statusResult.error || 'could not verify screen state' };
+      }
+      return {
+        session: parseScreenSessions(statusResult.output)
+          .find(item => item.name === screenName && item.state !== 'dead')
+      };
+    };
+
+    let { session, error } = await getSession();
+    if (error) return { ok: false, reason: error };
     if (!session) return { ok: false, reason: `screen session "${screenName}" exited` };
+    if (session.state === 'detached') return { ok: true };
+
+    if (session.state !== 'attached') {
+      return { ok: false, reason: `screen session is ${session.state}, not detached` };
+    }
+
+    // A user may have joined the session while the server was starting.  Send
+    // the screen command only in that case: `screen -X detach` errors for an
+    // already-detached session.
+    const detachResult = await this.executeCommand(
+      serverName,
+      `screen -S ${shellQuote(screenName)} -X detach`,
+      5000
+    );
+    if (!detachResult.success || (detachResult.code !== 0 && detachResult.code !== null)) {
+      return {
+        ok: false,
+        reason: detachResult.error || `screen detach command exited with code ${detachResult.code}`
+      };
+    }
+
+    ({ session, error } = await getSession());
+    if (error) return { ok: false, reason: error };
+    if (!session) return { ok: false, reason: `screen session "${screenName}" exited while detaching` };
     if (session.state !== 'detached') return { ok: false, reason: `screen session is ${session.state}, not detached` };
     return { ok: true };
   }
@@ -493,6 +524,7 @@ class SSHOperations {
       log.error(`${serverName}: ${message}`);
       return { success: false, error: message };
     }
+    log.info(`${serverName}: Read launcher config file from ${localPath} (${Buffer.byteLength(content, 'utf8')} bytes)`);
 
     if (isLocalHost(serverConfig.host)) {
       log.debug(`${serverName}: Using local config file ${localPath}`);
@@ -556,6 +588,7 @@ class SSHOperations {
       let command = `python -m ${serverConfig.server_module}`;
       if (moduleConfigPath) {
         command += ` --config ${shellQuote(moduleConfigPath)}`;
+        log.info(`${serverName}: Launching server with provided config file ${moduleConfigPath}`);
         log.debug(`${serverName}: Using config file ${moduleConfigPath}`);
       }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);

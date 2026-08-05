@@ -142,6 +142,27 @@ app.on('before-quit', (event) => {
   stopManagedServersForShutdown().finally(() => app.quit());
 });
 
+async function handleTerminationSignal(signal) {
+  log.info(`Received ${signal}; stopping Andon-started servers before exit`);
+  await stopManagedServersForShutdown();
+  process.exitCode = signal === 'SIGINT' ? 130 : 143;
+  app.exit(process.exitCode);
+}
+
+process.once('SIGINT', () => {
+  handleTerminationSignal('SIGINT').catch(error => {
+    log.error(`SIGINT shutdown failed: ${error.message}`);
+    app.exit(130);
+  });
+});
+
+process.once('SIGTERM', () => {
+  handleTerminationSignal('SIGTERM').catch(error => {
+    log.error(`SIGTERM shutdown failed: ${error.message}`);
+    app.exit(143);
+  });
+});
+
 app.on('activate', () => {
   log.debug('App activated');
   if (BrowserWindow.getAllWindows().length === 0) {

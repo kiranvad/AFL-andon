@@ -35,6 +35,10 @@ Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
 unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
 errors are written to the application terminal log rather than the card.
 
+When Andon closes, or receives `SIGINT`/`SIGTERM`, it sends the normal stop
+command to every launcher started or restarted during that Andon session.
+Launchers that were already running when Andon opened are not stopped.
+
 ## Prerequisites
 
 - **Node.js 20** or newer is required. Install via [nvm](https://github.com/nvm-sh/nvm) or your
