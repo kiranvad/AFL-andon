@@ -1,5 +1,7 @@
 // renderer.js (Renderer process)
 const { ipcRenderer } = require('electron');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const JSONEditor = require('jsoneditor');
@@ -571,6 +573,14 @@ function openServerWebview(serverName) {
   const serverConfig = config[serverName];
   setActiveTab(serverName);
   const webview = document.getElementById('server-webview');
+  if (serverConfig.server_type === 'tiled' || String(serverName).trim().toLowerCase() === 'tiled') {
+    const browserUrl = pathToFileURL(path.join(__dirname, 'tiled', 'browser', 'index.html'));
+    browserUrl.searchParams.set('server', serverName);
+    log.debug(`Loading bundled Tiled browser: ${browserUrl}`);
+    webview.src = browserUrl.toString();
+    activeTab = serverName;
+    return;
+  }
   const url = serverConfig.webview_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/`;
   log.debug(`Loading URL: ${url}`);
@@ -689,7 +699,9 @@ function openServerModal(serverName = null) {
     form.elements['server-username'].value = server.username;
     form.elements['server-http-port'].value = server.httpPort;
     form.elements['server-screen-name'].value = server.screen_name;
-    form.elements['server-type'].value = server.server_script ? 'script' : 'module';
+    form.elements['server-type'].value = server.server_type === 'tiled'
+      ? 'tiled'
+      : (server.server_script ? 'script' : 'module');
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
     form.elements['server-config-file-location'].value = server.config_file_location || '';
@@ -725,6 +737,14 @@ function updateServerTypeFields() {
   const serverType = document.getElementById('server-type').value;
   document.getElementById('script-group').style.display = serverType === 'script' ? 'block' : 'none';
   document.getElementById('module-group').style.display = serverType === 'module' ? 'block' : 'none';
+  const configInput = document.getElementById('server-config-file-location');
+  const isTiled = serverType === 'tiled';
+  configInput.required = isTiled;
+  configInput.placeholder = isTiled ? '/path/to/tiled_config.yml' : '/path/to/server-config.json';
+  document.getElementById('server-shell').closest('.form-group').style.display = isTiled ? 'none' : 'block';
+  document.getElementById('server-env-type').closest('.form-group').style.display = 'block';
+  document.getElementById('conda-group').style.display = document.getElementById('server-env-type').value === 'conda' ? 'block' : 'none';
+  document.getElementById('virtualenv-group').style.display = document.getElementById('server-env-type').value === 'pip' ? 'block' : 'none';
 }
 
 function updateEnvTypeFields() {
@@ -750,7 +770,10 @@ async function handleServerFormSubmit(event) {
   };
 
   const serverType = form.elements['server-type'].value;
-  if (serverType === 'script') {
+  if (serverType === 'tiled') {
+    serverConfig.server_type = 'tiled';
+    serverConfig.shell = 'bash';
+  } else if (serverType === 'script') {
     serverConfig.server_script = form.elements['server-script'].value;
   } else {
     serverConfig.server_module = form.elements['server-module'].value;
@@ -988,6 +1011,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadPaths();  // Load paths first
   await loadConfig();
   renderServers();
+
+  // The preload exposes only read-only, Tiled-specific IPC calls. It is used
+  // by the bundled Tiled page; ordinary server webviews do not call it.
+  const webview = document.getElementById('server-webview');
+  webview.setAttribute('preload', pathToFileURL(path.join(__dirname, 'tiled-webview-preload.js')).toString());
 
   // Set up event listeners
   document.getElementById('add-server-btn').addEventListener('click', () => openServerModal());

@@ -10,9 +10,13 @@ const SSHOperations = require('./sshOperations');
 
 let mainWindow;
 let sshOps;
-const andonStartedServers = new Set();
+// Track attempts, not only healthy launches. A detached `screen` can exist
+// before the health check fails, and it must be stopped when Andon exits.
+const andonManagedServers = new Set();
 let shutdownPromise;
 let shutdownComplete = false;
+let fatalShutdownInProgress = false;
+const tiledCatalogPathCache = new Map();
 const andonConfigPath = path.join(os.homedir(), '.afl', 'configs', 'andon.config.json');
 
 const ICON_PATH_MAC = path.join(__dirname, 'assets', 'icons', 'mac', 'icon.icns');
@@ -20,6 +24,227 @@ const ICON_PATH_PNG = path.join(__dirname, 'assets', 'icons', 'png', '256x256.pn
 
 function getAppIconPath() {
   return process.platform === 'darwin' ? ICON_PATH_MAC : ICON_PATH_PNG;
+}
+
+function isTiledLauncher(serverName) {
+  const server = sshOps?.config?.[serverName];
+  return server?.server_type === 'tiled' || String(serverName || '').trim().toLowerCase() === 'tiled';
+}
+
+function getTiledBaseUrl(serverName) {
+  if (!isTiledLauncher(serverName)) {
+    throw new Error('Tiled browser access is only available for the Tiled launcher.');
+  }
+  const server = sshOps?.config?.[serverName];
+  if (!server) throw new Error('The Tiled launcher is not configured.');
+
+  const rawUrl = server.webview_url || `http://${server.host}:${server.httpPort}/`;
+  let baseUrl;
+  try {
+    baseUrl = new URL(rawUrl);
+  } catch (_error) {
+    throw new Error(`The Tiled launcher has an invalid webview URL: ${rawUrl}`);
+  }
+  if (!['http:', 'https:'].includes(baseUrl.protocol)) {
+    throw new Error('The Tiled launcher URL must use HTTP or HTTPS.');
+  }
+  return new URL('/', baseUrl);
+}
+
+async function getTiledRequestHeaders(serverName) {
+  const server = sshOps?.config?.[serverName] || {};
+  const configPath = server.config_file_location?.trim();
+  let apiKey = '';
+  if (configPath) {
+    try {
+      const contents = await fs.readFile(configPath, 'utf8');
+      const match = contents.match(/^\s*single_user_api_key\s*:\s*([^#\r\n]+)/m);
+      if (match) {
+        apiKey = match[1].trim().replace(/^['"]|['"]$/g, '');
+      }
+    } catch (error) {
+      throw new Error(`Could not read the Tiled config file ${configPath}: ${error.message}`);
+    }
+  }
+  return {
+    Accept: 'application/vnd.api+json, application/json',
+    ...(apiKey ? { Authorization: `Apikey ${apiKey}` } : {})
+  };
+}
+
+function normalizeTiledPath(pathValue) {
+  const normalized = String(pathValue || '').trim().replace(/^\/+|\/+$/g, '');
+  if (normalized.includes('..')) throw new Error('Invalid Tiled catalog path.');
+  return normalized;
+}
+
+function encodeTiledPath(pathValue) {
+  return normalizeTiledPath(pathValue).split('/').filter(Boolean).map(encodeURIComponent).join('/');
+}
+
+async function getTiledCatalogPath(serverName) {
+  const server = sshOps?.config?.[serverName] || {};
+  const configuredPath = normalizeTiledPath(server.tiled_catalog_path);
+  if (configuredPath) return configuredPath;
+  if (tiledCatalogPathCache.has(serverName)) return tiledCatalogPathCache.get(serverName);
+
+  const baseUrl = getTiledBaseUrl(serverName);
+  const probeUrl = new URL('api/v1/metadata/run_documents', baseUrl);
+  const response = await fetch(probeUrl, { headers: await getTiledRequestHeaders(serverName) });
+  if (response.ok) {
+    tiledCatalogPathCache.set(serverName, 'run_documents');
+    return 'run_documents';
+  }
+  if (response.status === 404) {
+    // Native Tiled deployments such as Andon's bundled configuration store
+    // uploads at the root, while AFL server browsers use run_documents. Do
+    // not cache this negative result: an AFL service may create the container
+    // after Andon's first browser refresh.
+    return '';
+  }
+  throw new Error(`Could not inspect the Tiled catalog (${response.status}): ${await response.text()}`);
+}
+
+async function getTiledEntryPath(serverName, entryId) {
+  const safeId = normalizeTiledPath(entryId);
+  if (!safeId) throw new Error('Invalid Tiled entry ID.');
+  const catalogPath = await getTiledCatalogPath(serverName);
+  return catalogPath && safeId !== catalogPath && !safeId.startsWith(`${catalogPath}/`)
+    ? `${catalogPath}/${safeId}`
+    : safeId;
+}
+
+async function tiledSearch(serverName, {
+  offset = 0,
+  limit = 50,
+  // `attrs.meta.ended` and `meta.ended` coexist in this catalog and use a
+  // non-ISO timestamp format. In Tiled's REST sort syntax, `-` means use the
+  // catalog's default node ordering (time_created) in descending order.
+  sort = '-',
+  query = '',
+  queries = [],
+  filters = {}
+} = {}) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const catalogPath = await getTiledCatalogPath(serverName);
+  const searchPath = catalogPath ? `api/v1/search/${encodeTiledPath(catalogPath)}` : 'api/v1/search/';
+  const url = new URL(searchPath, baseUrl);
+  const safeOffset = Math.max(0, Number.parseInt(offset, 10) || 0);
+  const safeLimit = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 50));
+  url.searchParams.set('page[offset]', String(safeOffset));
+  url.searchParams.set('page[limit]', String(safeLimit));
+  url.searchParams.append('fields', 'metadata');
+  url.searchParams.append('fields', 'structure_family');
+  if (sort) url.searchParams.set('sort', sort);
+  const containsQueries = [
+    ...(query && String(query).trim() ? [{ field: 'sample_name', value: query }] : []),
+    ...(Array.isArray(queries) ? queries : [])
+  ];
+  for (const { field, value } of containsQueries) {
+    if (!field || value === null || value === undefined || String(value).trim() === '') continue;
+    const key = String(field).startsWith('attrs.') ? String(field) : `attrs.${field}`;
+    url.searchParams.append('filter[contains][condition][key]', key);
+    url.searchParams.append('filter[contains][condition][value]', JSON.stringify(String(value).trim()));
+  }
+  for (const [field, values] of Object.entries(filters || {})) {
+    const selected = (Array.isArray(values) ? values : [values]).filter(value => value !== '' && value !== null && value !== undefined);
+    if (!selected.length) continue;
+    const key = String(field).startsWith('attrs.') ? String(field) : `attrs.${field}`;
+    url.searchParams.append('filter[in][condition][key]', key);
+    url.searchParams.append('filter[in][condition][value]', JSON.stringify(selected));
+  }
+
+  const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
+  if (!response.ok) throw new Error(`Tiled search failed (${response.status}): ${await response.text()}`);
+  const payload = await response.json();
+  return { ...payload, andon_catalog_path: catalogPath || '/' };
+}
+
+async function tiledFullData(serverName, entryId) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const entryPath = await getTiledEntryPath(serverName, entryId);
+  const headers = await getTiledRequestHeaders(serverName);
+
+  const metadata = await tiledMetadata(serverName, entryPath);
+  const fullLink = metadata?.data?.links?.full;
+  const url = fullLink ? new URL(fullLink, baseUrl) : new URL(`api/v1/array/full/${encodeTiledPath(entryPath)}`, baseUrl);
+  if (url.origin !== baseUrl.origin || !url.pathname.startsWith('/api/v1/')) {
+    throw new Error('Tiled returned an invalid data link.');
+  }
+  url.searchParams.set('format', 'application/json');
+  const response = await fetch(url, { headers: { ...headers, Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`Tiled data request failed (${response.status}): ${await response.text()}`);
+  return response.json();
+}
+
+async function tiledContainerData(serverName, entryId) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const entryPath = await getTiledEntryPath(serverName, entryId);
+  const headers = await getTiledRequestHeaders(serverName);
+  const searchUrl = new URL(`api/v1/search/${encodeTiledPath(entryPath)}`, baseUrl);
+  searchUrl.searchParams.set('page[limit]', '100');
+  searchUrl.searchParams.append('fields', 'structure');
+  searchUrl.searchParams.append('fields', 'structure_family');
+  const catalogResponse = await fetch(searchUrl, { headers });
+  if (!catalogResponse.ok) throw new Error(`Tiled container search failed (${catalogResponse.status}): ${await catalogResponse.text()}`);
+  const catalog = await catalogResponse.json();
+  const items = Array.isArray(catalog.data) ? catalog.data.filter(item => item?.attributes?.structure_family === 'array') : [];
+  const values = await Promise.all(items.map(async item => {
+    const fullLink = item?.links?.full;
+    if (!fullLink) throw new Error(`Missing data link for ${item.id}`);
+    const url = new URL(fullLink, baseUrl);
+    if (url.origin !== baseUrl.origin || !url.pathname.startsWith('/api/v1/')) throw new Error(`Invalid data link for ${item.id}`);
+    url.searchParams.set('format', 'application/json');
+    const response = await fetch(url, { headers: { ...headers, Accept: 'application/json' } });
+    if (!response.ok) throw new Error(`Tiled data request for ${item.id} failed (${response.status})`);
+    return [item.id, await response.json()];
+  }));
+  return {
+    data: Object.fromEntries(values),
+    structures: Object.fromEntries(items.map(item => [item.id, item.attributes?.structure || {}]))
+  };
+}
+
+async function tiledDistinct(serverName, field, filters = {}) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const catalogPath = await getTiledCatalogPath(serverName);
+  const distinctPath = catalogPath ? `api/v1/distinct/${encodeTiledPath(catalogPath)}` : 'api/v1/distinct/';
+  const url = new URL(distinctPath, baseUrl);
+  const normalizedField = String(field || '').replace(/^attrs\./, '');
+  if (!normalizedField || normalizedField.includes('..')) throw new Error('Invalid Tiled metadata field.');
+  url.searchParams.append('metadata', `attrs.${normalizedField}`);
+  url.searchParams.append('metadata', normalizedField);
+  for (const [filterField, values] of Object.entries(filters || {})) {
+    const selected = (Array.isArray(values) ? values : [values]).filter(Boolean);
+    if (!selected.length) continue;
+    const key = String(filterField).startsWith('attrs.') ? String(filterField) : `attrs.${filterField}`;
+    url.searchParams.append('filter[in][condition][key]', key);
+    url.searchParams.append('filter[in][condition][value]', JSON.stringify(selected));
+  }
+  const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
+  if (!response.ok) throw new Error(`Tiled distinct request failed (${response.status}): ${await response.text()}`);
+  return response.json();
+}
+
+async function tiledMetadata(serverName, entryId) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const entryPath = await getTiledEntryPath(serverName, entryId);
+  const url = new URL(`api/v1/metadata/${encodeTiledPath(entryPath)}`, baseUrl);
+  const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
+  if (!response.ok) throw new Error(`Tiled metadata request failed (${response.status}): ${await response.text()}`);
+  return response.json();
+}
+
+async function tiledDataPreview(serverName, entryId) {
+  const payload = await tiledMetadata(serverName, entryId);
+  const attributes = payload?.data?.attributes || {};
+  return {
+    entry_id: payload?.data?.id || entryId,
+    structure_family: attributes.structure_family || 'unknown',
+    structure: attributes.structure || null,
+    metadata: attributes.metadata || {},
+    note: 'This is a dataset summary. Full array values are intentionally not loaded here; use Plot Selected to load data for visualization.'
+  };
 }
 
 // Set default paths (use os.homedir() since app.getPath() isn't available at load time)
@@ -79,8 +304,8 @@ async function stopManagedServersForShutdown() {
   shutdownPromise = (async () => {
     if (!sshOps) return;
 
-    const serverNames = [...andonStartedServers];
-    log.info(`Stopping ${serverNames.length} Andon-started server(s) before shutdown`);
+    const serverNames = [...andonManagedServers];
+    log.info(`Stopping ${serverNames.length} Andon-managed server(s) before shutdown`);
     const results = await Promise.allSettled(
       serverNames.map(serverName => sshOps.stopServer(serverName))
     );
@@ -145,8 +370,20 @@ app.on('before-quit', (event) => {
 async function handleTerminationSignal(signal) {
   log.info(`Received ${signal}; stopping Andon-started servers before exit`);
   await stopManagedServersForShutdown();
-  process.exitCode = signal === 'SIGINT' ? 130 : 143;
+  process.exitCode = signal === 'SIGINT' ? 130 : signal === 'SIGQUIT' ? 131 : 143;
   app.exit(process.exitCode);
+}
+
+async function handleFatalError(kind, error) {
+  if (fatalShutdownInProgress) return;
+  fatalShutdownInProgress = true;
+  log.error(`${kind}: ${error?.stack || error}`);
+  try {
+    await stopManagedServersForShutdown();
+  } catch (shutdownError) {
+    log.error(`${kind}: shutdown cleanup failed: ${shutdownError.message}`);
+  }
+  app.exit(1);
 }
 
 process.once('SIGINT', () => {
@@ -163,6 +400,28 @@ process.once('SIGTERM', () => {
   });
 });
 
+process.once('SIGHUP', () => {
+  handleTerminationSignal('SIGHUP').catch(error => {
+    log.error(`SIGHUP shutdown failed: ${error.message}`);
+    app.exit(143);
+  });
+});
+
+process.once('SIGQUIT', () => {
+  handleTerminationSignal('SIGQUIT').catch(error => {
+    log.error(`SIGQUIT shutdown failed: ${error.message}`);
+    app.exit(131);
+  });
+});
+
+process.once('uncaughtException', error => {
+  handleFatalError('Uncaught exception', error);
+});
+
+process.once('unhandledRejection', error => {
+  handleFatalError('Unhandled rejection', error);
+});
+
 app.on('activate', () => {
   log.debug('App activated');
   if (BrowserWindow.getAllWindows().length === 0) {
@@ -173,6 +432,9 @@ app.on('activate', () => {
 
 ipcMain.handle('start-server', async (event, serverName) => {
   log.info(`IPC: start-server requested for ${serverName}`);
+  // Register before invoking the launcher: startServer can create a screen
+  // and bind a port before a later health/detach check returns failure.
+  andonManagedServers.add(serverName);
   try {
     const result = await sshOps.startServer(serverName);
     if (result.sshDown) {
@@ -183,7 +445,6 @@ ipcMain.handle('start-server', async (event, serverName) => {
       log.error(`start-server: ${serverName} failed to start: ${result.error || 'Unknown error'}`);
       return result;
     }
-    andonStartedServers.add(serverName);
     log.info(`start-server: ${serverName} started successfully`);
     return result;
   } catch (error) {
@@ -200,7 +461,7 @@ ipcMain.handle('stop-server', async (event, serverName) => {
       log.warn(`stop-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
-    if (result.success) andonStartedServers.delete(serverName);
+    if (result.success) andonManagedServers.delete(serverName);
     log.info(`stop-server: ${serverName} stopped successfully`);
     return result;
   } catch (error) {
@@ -211,6 +472,7 @@ ipcMain.handle('stop-server', async (event, serverName) => {
 
 ipcMain.handle('restart-server', async (event, serverName) => {
   log.info(`IPC: restart-server requested for ${serverName}`);
+  andonManagedServers.add(serverName);
   try {
     const result = await sshOps.restartServer(serverName);
     if (result.sshDown) {
@@ -221,7 +483,6 @@ ipcMain.handle('restart-server', async (event, serverName) => {
       log.error(`restart-server: ${serverName} failed to restart: ${result.error || 'Unknown error'}`);
       return result;
     }
-    andonStartedServers.add(serverName);
     log.info(`restart-server: ${serverName} restarted successfully`);
     return result;
   } catch (error) {
@@ -352,6 +613,91 @@ ipcMain.handle('get-config', async () => {
   const serverCount = Object.keys(sshOps.config).length;
   log.debug(`get-config: Returning config with ${serverCount} servers`);
   return sshOps.config;
+});
+
+// These endpoints are intentionally restricted to a Tiled-type launcher (with
+// a legacy fallback for a launcher named "tiled"). The bundled browser uses them so it can read the Tiled catalog
+// without depending on an AFL driver or on browser CORS configuration.
+ipcMain.handle('tiled-search', async (_event, serverName, options) => {
+  try {
+    return { success: true, data: await tiledSearch(serverName, options) };
+  } catch (error) {
+    log.warn(`tiled-search failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-metadata', async (_event, serverName, entryId) => {
+  try {
+    return { success: true, data: await tiledMetadata(serverName, entryId) };
+  } catch (error) {
+    log.warn(`tiled-metadata failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-full-data', async (_event, serverName, entryId) => {
+  try {
+    return { success: true, data: await tiledFullData(serverName, entryId) };
+  } catch (error) {
+    log.warn(`tiled-full-data failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-data-preview', async (_event, serverName, entryId) => {
+  try {
+    return { success: true, data: await tiledDataPreview(serverName, entryId) };
+  } catch (error) {
+    log.warn(`tiled-data-preview failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-container-data', async (_event, serverName, entryId) => {
+  try {
+    return { success: true, data: await tiledContainerData(serverName, entryId) };
+  } catch (error) {
+    log.warn(`tiled-container-data failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-distinct', async (_event, serverName, field, filters) => {
+  try {
+    return { success: true, data: await tiledDistinct(serverName, field, filters) };
+  } catch (error) {
+    log.warn(`tiled-distinct failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-open-plot', async (event, serverName, entryIds) => {
+  try {
+    if (!isTiledLauncher(serverName)) throw new Error('Plotting is only available for a Tiled launcher.');
+    const ids = Array.isArray(entryIds) ? [...new Set(entryIds.map(id => String(id || '').trim()).filter(Boolean))] : [];
+    if (!ids.length) throw new Error('Select at least one Tiled entry to plot.');
+    const plotWindow = new BrowserWindow({
+      width: 1200,
+      height: 860,
+      minWidth: 820,
+      minHeight: 620,
+      title: 'Tiled Plot Viewer',
+      webPreferences: {
+        preload: path.join(__dirname, 'tiled-webview-preload.js'),
+        contextIsolation: true,
+        nodeIntegration: false
+      }
+    });
+    plotWindow.setMenuBarVisibility(false);
+    await plotWindow.loadFile(path.join(__dirname, 'tiled', 'browser', 'plot.html'), {
+      query: { server: String(serverName), plotEntries: JSON.stringify(ids) }
+    });
+    return { success: true };
+  } catch (error) {
+    log.warn(`tiled-open-plot failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('add-server', async (event, { serverName, serverConfig }) => {

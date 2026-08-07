@@ -595,6 +595,7 @@
                     <select id="server-type" required>
                         <option value="script">Script</option>
                         <option value="module">Module</option>
+                        <option value="tiled">Tiled</option>
                     </select>
                 </div>
                 <div class="form-group" id="script-group">
@@ -605,7 +606,7 @@
                     <label for="server-module">Server Module:</label>
                     <input type="text" id="server-module">
                 </div>
-                <div class="form-group">
+                <div class="form-group" id="config-file-group">
                     <label for="server-config-file-location">Config file location:</label>
                     <input type="text" id="server-config-file-location" placeholder="/path/to/server-config.json">
                 </div>
@@ -617,7 +618,7 @@
                     <label for="server-env-type">Environment Type:</label>
                     <select id="server-env-type">
                         <option value="conda">Conda</option>
-                        <option value="pip">Virtualenv (pip)</option>
+                        <option value="pip">Virtualenv (pip/uv)</option>
                     </select>
                 </div>
                 <div class="form-group" id="conda-group">

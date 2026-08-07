@@ -145,11 +145,30 @@ that copy before starting it through Andon.
 2. Edit the copied `tiled_config.yml` if authenticated writes are required.
    Set a local `single_user_api_key` value under `authentication`; do not add
    that value to the repository or to `launchers.json`.
-3. In AFL-andon, create a Script launcher that points `Server Script` to the
-   copied `start_tiled.sh`. Use a unique screen name, set the HTTP port to
-   `8000`, and set `Status URL` to `http://<host>:8000/healthz`.
+3. In AFL-andon, create a **Tiled** launcher, select the copied
+   `tiled_config.yml` as its `Config file location`, use a unique screen name,
+   set the HTTP port to `8000`, and set `Status URL` to
+   `http://<host>:8000/healthz`.
 4. Start the launcher from Andon. The server's logs remain available through
    the **View Log** control.
+
+### Tiled browser tab
+
+Select **Tiled** as the server type and set **Config file location** to the
+local `tiled_config.yml` file. Choose either the `afl_agent` Conda environment
+or a virtualenv (pip/uv); Andon copies that file to a remote host when needed
+and launches `tiled serve config <file>`. Clicking this launcher's
+existing sidebar tab opens Andon's bundled Tiled database browser in the same
+webview. The browser automatically uses the `run_documents` catalog when it is
+present (matching the browser served by AFL drivers such as OT2 and RGBCamera)
+and otherwise reads the root catalog. The active catalog is shown beside the
+connection status. Results are shown in pages of 50 entries. Filter choices
+are read from Tiled's distinct-metadata endpoint; selecting **Data** or
+**Metadata** on an entry reads only that entry. These are read-only requests.
+
+If the Tiled YAML includes `authentication.single_user_api_key`, Andon reads
+it from the selected config file and sends it only to that launcher's Tiled
+API; it is not stored in `launchers.json` or exposed to the browser page.
 
 ## Building
 

@@ -555,11 +555,11 @@ class SSHOperations {
       return { success: false, error: 'Server not found' };
     }
 
-    let moduleConfigPath = null;
-    if (serverConfig.server_module) {
+    let launchConfigPath = null;
+    if (serverConfig.server_module || serverConfig.server_type === 'tiled') {
       const configResult = await this.resolveModuleConfigPath(serverName, serverConfig);
       if (!configResult.success) return configResult;
-      moduleConfigPath = configResult.configPath;
+      launchConfigPath = configResult.configPath;
     }
     
     // Detect remote OS to use appropriate screen options
@@ -586,10 +586,10 @@ class SSHOperations {
 
     if (serverConfig.server_module) {
       let command = `python -m ${serverConfig.server_module}`;
-      if (moduleConfigPath) {
-        command += ` --config ${shellQuote(moduleConfigPath)}`;
-        log.info(`${serverName}: Launching server with provided config file ${moduleConfigPath}`);
-        log.debug(`${serverName}: Using config file ${moduleConfigPath}`);
+      if (launchConfigPath) {
+        command += ` --config ${shellQuote(launchConfigPath)}`;
+        log.info(`${serverName}: Launching server with provided config file ${launchConfigPath}`);
+        log.debug(`${serverName}: Using config file ${launchConfigPath}`);
       }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
       
@@ -608,6 +608,24 @@ class SSHOperations {
       }
       
       startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci ${shellQuote(command)}`;
+    } else if (serverConfig.server_type === 'tiled') {
+      if (!launchConfigPath) {
+        return { success: false, error: 'Tiled requires a config file location.' };
+      }
+      // Tiled config files commonly use relative catalog/storage paths. Match
+      // tiled/start_tiled.sh by serving from the config file's directory.
+      const tiledConfigDirectory = path.dirname(launchConfigPath);
+      let command = `cd ${shellQuote(tiledConfigDirectory)} && tiled serve config ${shellQuote(launchConfigPath)}`;
+      // Keep the start path consistent with tiled/start_tiled.sh.
+      if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
+        command = `source ${shellQuote(path.join(serverConfig.virtualenv_path, 'bin', 'activate'))};${command}`;
+      } else {
+        command = `conda activate ${shellQuote(serverConfig.conda_env || 'afl_agent')};${command}`;
+      }
+      if (isMacOs) {
+        command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
+      }
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell || 'bash'} -ci ${shellQuote(command)}`;
     } else if (serverConfig.server_script) {
       log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
       if (isMacOs) {

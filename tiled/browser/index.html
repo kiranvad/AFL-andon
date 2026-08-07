@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tiled Database Browser</title>
+  <link rel="stylesheet" href="tiled_browser.css">
+</head>
+<body>
+  <main id="app-container">
+    <header id="header">
+      <h1>Tiled Database Browser</h1>
+      <div id="connection-status" class="status-loading"><span class="status-indicator"></span><span class="status-text">Connecting…</span></div>
+    </header>
+
+    <section id="controls" aria-label="Search controls">
+      <div class="tab-container">
+        <div class="tab-buttons"><button class="tab-button active" type="button">Search</button></div>
+        <div class="tab-content active">
+          <div id="filter-selects"></div>
+          <div id="filter-buttons"><button id="apply-filters-button" type="button">Apply Filters</button><button id="clear-filters-button" type="button">Clear Filters</button></div>
+          <div class="search-section-divider"></div>
+          <div class="search-section-heading">Advanced Search</div>
+          <div id="query-rows"></div>
+          <div id="search-buttons"><button id="add-query-button" type="button">+ Add Query</button><button id="search-button" type="button">Search</button><button id="clear-search-button" type="button">Clear All</button></div>
+        </div>
+      </div>
+      <div id="info-bar">
+        <span id="total-count">Total: 0 entries</span>
+        <div id="selection-controls">
+          <button id="refresh-button" type="button">↻ Refresh</button>
+          <button id="select-all-button" type="button">Select All</button>
+          <button id="copy-entry-id-button" type="button" disabled>Copy Entry ID</button>
+          <button id="copy-sample-uuid-button" type="button" disabled>Copy Sample UUID</button>
+          <button id="plot-selected-btn" type="button" disabled>Plot Selected</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="error-container" hidden role="alert"><span class="error-icon">⚠</span><span id="error-text"></span><button id="error-close" type="button" aria-label="Close">×</button></section>
+    <section id="grid-container" aria-label="Tiled catalog">
+      <div id="loading-overlay"><span class="loading-spinner"></span><span>Loading Tiled data…</span></div>
+      <div class="table-wrap"><table><thead id="entries-head"></thead><tbody id="entries"></tbody></table></div>
+      <footer id="pagination"><button id="previous-page" type="button">Previous</button><span id="page-summary"></span><button id="next-page" type="button">Next</button></footer>
+    </section>
+  </main>
+
+  <dialog id="metadata-dialog" class="modal"><article><header><h2>Metadata View</h2><button class="modal-close" id="close-metadata" type="button" aria-label="Close">×</button></header><pre id="metadata"></pre></article></dialog>
+  <dialog id="data-dialog" class="modal"><article><header><h2>Dataset Summary</h2><button class="modal-close" id="close-data" type="button" aria-label="Close">×</button></header><pre id="dataset-data"></pre></article></dialog>
+  <dialog id="plot-dialog" class="modal plot-modal"><article><header><div><h2>Tiled Plot Viewer</h2><p id="plot-dataset-count">Loading selected data…</p></div><button class="modal-close" id="close-plot" type="button" aria-label="Close">×</button></header><p id="plot-error" hidden role="alert"></p><section class="plot-top-controls"><label>Dataset <select id="plot-dataset"></select></label><label>Plot mode <select id="plot-mode"><option value="auto">Auto</option><option value="3d">3D</option><option value="image">Image</option></select></label><label class="color-toggle"><input id="plot-z-color" type="checkbox"> Color</label></section><section class="plot-axis-controls" aria-label="Plot axes"><div class="plot-axis-row"><strong>X axis</strong><label>Variable <select id="plot-x-variable"></select></label><label>Dimension / component <select id="plot-x-component"></select></label></div><div class="plot-axis-row"><strong>Y axis</strong><label>Variable <select id="plot-y-variable"></select></label><label>Dimension / component <select id="plot-y-component"></select></label></div><div class="plot-axis-row"><strong>Z axis</strong><label>Variable <select id="plot-z-variable"></select></label><label>Dimension / component <select id="plot-z-component"></select></label></div></section><div id="plot-widget" aria-label="Selected Tiled data plot"></div><div class="plot-actions"><button id="update-plot" type="button">Update Plot</button></div><p id="plot-empty">Select compatible data variables to plot the selected dataset.</p></article></dialog>
+  <dialog id="copy-dialog" class="modal"><article><header><h2 id="copy-title">Copy</h2><button class="modal-close" id="close-copy" type="button" aria-label="Close">×</button></header><textarea id="copy-text" readonly></textarea><footer><button id="copy-button" type="button">Copy to Clipboard</button></footer></article></dialog>
+  <script src="vendor/plotly.min.js"></script>
+  <script src="plot_utils.js"></script>
+  <script src="tiled_browser.js"></script>
+</body>
+</html>
