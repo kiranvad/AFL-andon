@@ -16,6 +16,8 @@ const andonManagedServers = new Set();
 let shutdownPromise;
 let shutdownComplete = false;
 let fatalShutdownInProgress = false;
+let closeConfirmationInProgress = false;
+let allowWindowClose = false;
 const tiledCatalogPathCache = new Map();
 const andonConfigPath = path.join(os.homedir(), '.afl', 'configs', 'andon.config.json');
 
@@ -64,6 +66,19 @@ async function getTiledRequestHeaders(serverName) {
       }
     } catch (error) {
       throw new Error(`Could not read the Tiled config file ${configPath}: ${error.message}`);
+    }
+  }
+  // AFL stores its runtime Tiled credential in a timestamped configuration
+  // history. Native Andon browser requests should use that existing key when
+  // the launcher YAML intentionally omits credentials from version control.
+  if (!apiKey) {
+    try {
+      const aflConfig = JSON.parse(await fs.readFile(path.join(os.homedir(), '.afl', 'config.json'), 'utf8'));
+      const records = Array.isArray(aflConfig) ? aflConfig : Object.values(aflConfig || {});
+      const latestKey = [...records].reverse().find(record => typeof record?.tiled_api_key === 'string' && record.tiled_api_key.trim())?.tiled_api_key;
+      apiKey = latestKey?.trim() || '';
+    } catch (error) {
+      log.debug(`No usable AFL Tiled API key found: ${error.message}`);
     }
   }
   return {
@@ -117,6 +132,7 @@ async function getTiledEntryPath(serverName, entryId) {
 async function tiledSearch(serverName, {
   offset = 0,
   limit = 50,
+  cursor = null,
   // `attrs.meta.ended` and `meta.ended` coexist in this catalog and use a
   // non-ISO timestamp format. In Tiled's REST sort syntax, `-` means use the
   // catalog's default node ordering (time_created) in descending order.
@@ -131,7 +147,14 @@ async function tiledSearch(serverName, {
   const url = new URL(searchPath, baseUrl);
   const safeOffset = Math.max(0, Number.parseInt(offset, 10) || 0);
   const safeLimit = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 50));
-  url.searchParams.set('page[offset]', String(safeOffset));
+  // Tiled servers may use either offsets or opaque cursors. Prefer the
+  // cursor supplied by the previous response so paging continues past the
+  // first server-side page limit.
+  if (cursor) {
+    url.searchParams.set('page[cursor]', String(cursor));
+  } else {
+    url.searchParams.set('page[offset]', String(safeOffset));
+  }
   url.searchParams.set('page[limit]', String(safeLimit));
   url.searchParams.append('fields', 'metadata');
   url.searchParams.append('fields', 'structure_family');
@@ -295,6 +318,30 @@ async function createWindow() {
 
   log.debug('Loading index.html');
   await mainWindow.loadFile('index.html');
+  mainWindow.on('close', async event => {
+    if (allowWindowClose) return;
+
+    event.preventDefault();
+    if (closeConfirmationInProgress) return;
+    closeConfirmationInProgress = true;
+    try {
+      const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'warning',
+        buttons: ['Cancel', 'Close Andon'],
+        defaultId: 0,
+        cancelId: 0,
+        title: 'Close AFL Andon?',
+        message: 'Closing Andon will stop all running servers.',
+        detail: 'Do you want to close AFL Andon and stop the servers it started?'
+      });
+      if (response === 1) {
+        allowWindowClose = true;
+        mainWindow.close();
+      }
+    } finally {
+      closeConfirmationInProgress = false;
+    }
+  });
   log.info('Main window created successfully');
 }
 

@@ -8,6 +8,7 @@
     ['sample_uuid', 'Sample UUID'], ['sample_name', 'Sample Name'], ['AL_campaign_name', 'AL Campaign'],
     ['AL_uuid', 'AL UUID'], ['AL_components', 'AL Components']
   ];
+  const COLUMN_PREFERENCES_KEY = 'afl-andon.tiled.visible-columns';
   const serverName = new URLSearchParams(location.search).get('server') || 'tiled';
   const standalonePlotEntries = (() => {
     try {
@@ -17,8 +18,15 @@
   })();
   // Tiled's `-` sort token requests descending catalog creation time. This
   // avoids the mixed legacy/current metadata ended fields.
-  const state = { offset: 0, total: 0, rows: [], selected: new Set(), filters: {}, sort: '-', plotData: [], catalogPath: '', distinctValues: {} };
+  const state = { offset: 0, total: 0, rows: [], selected: new Set(), filters: {}, sort: '-', plotData: [], catalogPath: '', distinctValues: {}, cursor: null, nextCursor: null, pageHistory: [], visibleColumns: new Set(COLUMNS.map(([field]) => field)) };
   const $ = id => document.getElementById(id);
+
+  try {
+    const savedColumns = JSON.parse(localStorage.getItem(COLUMN_PREFERENCES_KEY));
+    if (Array.isArray(savedColumns)) {
+      state.visibleColumns = new Set(savedColumns.filter(field => COLUMNS.some(([name]) => name === field)));
+    }
+  } catch (_) { /* Keep the default columns when storage is unavailable. */ }
 
   const nested = (obj, path) => path.split('.').reduce((value, key) => value && value[key], obj);
   function metadataFor(item) { return item?.attributes?.metadata || item?.metadata || {}; }
@@ -98,9 +106,35 @@
     return `attrs.${field}`;
   }
 
+  function visibleColumns() { return COLUMNS.filter(([field]) => state.visibleColumns.has(field)); }
+  function saveVisibleColumns() {
+    try { localStorage.setItem(COLUMN_PREFERENCES_KEY, JSON.stringify([...state.visibleColumns])); } catch (_) { /* Preferences are optional. */ }
+  }
+  function renderColumnPicker() {
+    const options = $('column-options');
+    options.replaceChildren();
+    COLUMNS.forEach(([field, label]) => {
+      const option = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox'; checkbox.checked = state.visibleColumns.has(field);
+      checkbox.addEventListener('change', () => {
+        checkbox.checked ? state.visibleColumns.add(field) : state.visibleColumns.delete(field);
+        saveVisibleColumns(); renderRows();
+      });
+      option.append(checkbox, document.createTextNode(label)); options.append(option);
+    });
+  }
+  function resetPagination() {
+    state.offset = 0; state.cursor = null; state.nextCursor = null; state.pageHistory = [];
+  }
+  function cursorFromLink(link) {
+    if (!link) return null;
+    try { return new URL(link).searchParams.get('page[cursor]'); } catch (_) { return null; }
+  }
+
   function renderHeader() {
     const tr = document.createElement('tr'); const select = document.createElement('th'); select.textContent = 'Select'; tr.append(select);
-    COLUMNS.forEach(([field, label]) => { const th = document.createElement('th'); const sort = document.createElement('button'); sort.type = 'button'; const key = tiledFieldPath(field); const recent = key === '__recent__'; const prefix = recent && state.sort === '-' ? ' ▼' : !recent && state.sort === key ? ' ▲' : !recent && state.sort === `-${key}` ? ' ▼' : ''; sort.textContent = label + prefix; sort.addEventListener('click', () => { state.sort = recent ? (state.sort === '-' ? '' : '-') : (state.sort === key ? `-${key}` : key); state.offset = 0; load(); }); th.append(sort); tr.append(th); });
+    visibleColumns().forEach(([field, label]) => { const th = document.createElement('th'); const sort = document.createElement('button'); sort.type = 'button'; const key = tiledFieldPath(field); const recent = key === '__recent__'; const prefix = recent && state.sort === '-' ? ' ▼' : !recent && state.sort === key ? ' ▲' : !recent && state.sort === `-${key}` ? ' ▼' : ''; sort.textContent = label + prefix; sort.addEventListener('click', () => { state.sort = recent ? (state.sort === '-' ? '' : '-') : (state.sort === key ? `-${key}` : key); resetPagination(); load(); }); th.append(sort); tr.append(th); });
     const actions = document.createElement('th'); actions.textContent = 'Actions'; tr.append(actions); $('entries-head').replaceChildren(tr);
   }
   function updateSelectionControls() {
@@ -111,20 +145,20 @@
     renderHeader(); const body = $('entries'); body.replaceChildren();
     state.rows.forEach(row => {
       const tr = document.createElement('tr'); const selectCell = document.createElement('td'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = state.selected.has(row.id); checkbox.addEventListener('change', () => { checkbox.checked ? state.selected.add(row.id) : state.selected.delete(row.id); updateSelectionControls(); }); selectCell.append(checkbox); tr.append(selectCell);
-      COLUMNS.forEach(([field]) => { const cell = document.createElement('td'); if (field === 'id') cell.className = 'entry-id'; cell.textContent = display(row[field]); tr.append(cell); });
+      visibleColumns().forEach(([field]) => { const cell = document.createElement('td'); if (field === 'id') cell.className = 'entry-id'; cell.textContent = display(row[field]); tr.append(cell); });
       const actionCell = document.createElement('td'); actionCell.className = 'actions';
       const data = createRowAction('Data', `View data for ${row.id}`, () => showData(row.id));
       const metadata = createRowAction('Metadata', `View metadata for ${row.id}`, () => showMetadata(row.id));
       actionCell.append(data, metadata); tr.append(actionCell); body.append(tr);
     });
-    $('total-count').textContent = `Total: ${state.total} entries`; const start = state.total ? state.offset + 1 : 0; $('page-summary').textContent = `Showing ${start}–${Math.min(state.offset + state.rows.length, state.total)} of ${state.total}`; $('previous-page').disabled = state.offset === 0; $('next-page').disabled = state.offset + state.rows.length >= state.total; updateSelectionControls();
+    $('total-count').textContent = `Total: ${state.total} entries`; const start = state.rows.length ? state.offset + 1 : 0; const end = state.rows.length ? state.offset + state.rows.length : 0; $('page-summary').textContent = `Showing ${start}–${end} of ${state.total}`; $('previous-page').disabled = state.pageHistory.length === 0; $('next-page').disabled = !state.nextCursor; updateSelectionControls();
   }
   async function load() {
     loading(true); showError(); setStatus('loading', 'Loading…');
     try {
-      const result = await window.tiledBrowser.search(serverName, { offset: state.offset, limit: PAGE_SIZE, sort: state.sort, queries: currentQueries(), filters: state.filters });
+      const result = await window.tiledBrowser.search(serverName, { offset: state.offset, cursor: state.cursor, limit: PAGE_SIZE, sort: state.sort, queries: currentQueries(), filters: state.filters });
       if (!result.success) throw new Error(result.error);
-      const payload = result.data || {}; state.rows = (Array.isArray(payload.data) ? payload.data : []).map(rowFor); state.total = Number(payload.meta?.count ?? payload.total_count ?? state.rows.length); state.catalogPath = payload.andon_catalog_path || '/'; state.selected.clear(); renderFilters(); renderRows(); setStatus('connected', `Connected · ${state.catalogPath}`);
+      const payload = result.data || {}; state.rows = (Array.isArray(payload.data) ? payload.data : []).map(rowFor); state.total = Number(payload.meta?.count ?? payload.total_count ?? state.rows.length); state.nextCursor = cursorFromLink(payload.links?.next); state.catalogPath = payload.andon_catalog_path || '/'; state.selected.clear(); renderFilters(); renderRows(); setStatus('connected', `Connected · ${state.catalogPath}`);
     } catch (error) { state.rows = []; state.total = 0; renderRows(); showError(error.message || 'Tiled request failed.'); setStatus('error', 'Connection Error'); }
     finally { loading(false); }
   }
@@ -233,10 +267,10 @@
       $('plot-empty').hidden = true;
     } catch (error) { window.Plotly.purge('plot-widget'); showPlotError(error.message || 'Unable to render the selected plot.'); $('plot-empty').hidden = false; }
   }
-  function clearAll() { state.filters = {}; $('query-rows').replaceChildren(); addQuery(); state.offset = 0; load(); }
+  function clearAll() { state.filters = {}; $('query-rows').replaceChildren(); addQuery(); resetPagination(); load(); }
   function closePlot() { $('plot-dialog').close(); if (standalonePlotEntries.length) window.close(); }
   function setup() {
-    $('apply-filters-button').addEventListener('click', () => { state.offset = 0; load(); }); $('clear-filters-button').addEventListener('click', () => { state.filters = {}; state.distinctValues = {}; renderFilters(); }); $('add-query-button').addEventListener('click', () => addQuery()); $('search-button').addEventListener('click', () => { state.offset = 0; load(); }); $('clear-search-button').addEventListener('click', clearAll); $('refresh-button').addEventListener('click', load); $('previous-page').addEventListener('click', () => { state.offset = Math.max(0, state.offset - PAGE_SIZE); load(); }); $('next-page').addEventListener('click', () => { state.offset += PAGE_SIZE; load(); }); $('select-all-button').addEventListener('click', () => { state.rows.forEach(row => state.selected.add(row.id)); renderRows(); }); $('copy-entry-id-button').addEventListener('click', () => openCopy(`Copy Entry ID (${state.selected.size})`, selectedRows().map(row => row.id).join(', '))); $('copy-sample-uuid-button').addEventListener('click', () => openCopy(`Copy Sample UUID (${state.selected.size})`, selectedRows().map(row => row.sample_uuid).filter(Boolean).join(', '))); $('copy-button').addEventListener('click', async () => { await navigator.clipboard.writeText($('copy-text').value); }); $('plot-selected-btn').addEventListener('click', plotSelected); $('plot-dataset').addEventListener('change', () => { populatePlotControls(); drawPlot(); }); ['x', 'y', 'z'].forEach(axis => { axisVariableSelect(axis).addEventListener('change', () => { populateAxisComponent(axis); drawPlot(); }); axisComponentSelect(axis).addEventListener('change', drawPlot); }); $('plot-mode').addEventListener('change', drawPlot); $('plot-z-color').addEventListener('change', drawPlot); $('update-plot').addEventListener('click', drawPlot); [['close-metadata', 'metadata-dialog'], ['close-data', 'data-dialog'], ['close-copy', 'copy-dialog']].forEach(([button, dialog]) => $(button).addEventListener('click', () => $(dialog).close())); $('close-plot').addEventListener('click', closePlot); $('error-close').addEventListener('click', () => showError());
+    $('apply-filters-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-filters-button').addEventListener('click', () => { state.filters = {}; state.distinctValues = {}; resetPagination(); renderFilters(); }); $('add-query-button').addEventListener('click', () => addQuery()); $('search-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-search-button').addEventListener('click', clearAll); $('refresh-button').addEventListener('click', load); $('previous-page').addEventListener('click', () => { const previous = state.pageHistory.pop(); if (!previous) return; state.cursor = previous.cursor; state.offset = previous.offset; load(); }); $('next-page').addEventListener('click', () => { if (!state.nextCursor) return; state.pageHistory.push({ cursor: state.cursor, offset: state.offset }); state.cursor = state.nextCursor; state.offset += state.rows.length; load(); }); $('select-all-button').addEventListener('click', () => { state.rows.forEach(row => state.selected.add(row.id)); renderRows(); }); $('copy-entry-id-button').addEventListener('click', () => openCopy(`Copy Entry ID (${state.selected.size})`, selectedRows().map(row => row.id).join(', '))); $('copy-sample-uuid-button').addEventListener('click', () => openCopy(`Copy Sample UUID (${state.selected.size})`, selectedRows().map(row => row.sample_uuid).filter(Boolean).join(', '))); $('copy-button').addEventListener('click', async () => { await navigator.clipboard.writeText($('copy-text').value); }); $('plot-selected-btn').addEventListener('click', plotSelected); $('plot-dataset').addEventListener('change', () => { populatePlotControls(); drawPlot(); }); ['x', 'y', 'z'].forEach(axis => { axisVariableSelect(axis).addEventListener('change', () => { populateAxisComponent(axis); drawPlot(); }); axisComponentSelect(axis).addEventListener('change', drawPlot); }); $('plot-mode').addEventListener('change', drawPlot); $('plot-z-color').addEventListener('change', drawPlot); $('update-plot').addEventListener('click', drawPlot); [['close-metadata', 'metadata-dialog'], ['close-data', 'data-dialog'], ['close-copy', 'copy-dialog']].forEach(([button, dialog]) => $(button).addEventListener('click', () => $(dialog).close())); $('close-plot').addEventListener('click', closePlot); $('error-close').addEventListener('click', () => showError());
   }
-  document.addEventListener('DOMContentLoaded', () => { renderFilters(); addQuery(); setup(); if (standalonePlotEntries.length) { document.body.classList.add('plot-only'); plotEntries(standalonePlotEntries); } else load(); });
+  document.addEventListener('DOMContentLoaded', () => { renderFilters(); renderColumnPicker(); addQuery(); setup(); if (standalonePlotEntries.length) { document.body.classList.add('plot-only'); plotEntries(standalonePlotEntries); } else load(); });
 })();
