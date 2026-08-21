@@ -183,10 +183,14 @@
     $('metadata').textContent = JSON.stringify(result.data?.data?.attributes?.metadata ?? result.data, null, 2);
   }
   async function showData(entryId) {
-    openLoadingDialog('data-dialog', 'dataset-data', 'Loading dataset summary…');
+    openLoadingDialog('data-dialog', 'dataset-data', 'Loading dataset structure…');
     const result = await window.tiledBrowser.dataPreview(serverName, entryId);
     if (!result.success) { $('data-dialog').close(); return showError(result.error); }
-    $('dataset-data').textContent = JSON.stringify(result.data, null, 2);
+    if (result.data?.structure_family === 'container') {
+      const container = await window.tiledBrowser.containerStructure(serverName, entryId);
+      if (!container.success) { $('data-dialog').close(); return showError(container.error); }
+      $('dataset-data').textContent = window.TiledPlotUtils.structureSummary({ variables: container.data.structures });
+    } else $('dataset-data').textContent = window.TiledPlotUtils.structureSummary(result.data?.structure);
   }
   function selectedRows() { return state.rows.filter(row => state.selected.has(row.id)); }
   function openCopy(title, text) { $('copy-title').textContent = title; $('copy-text').value = text; $('copy-dialog').showModal(); }
@@ -194,15 +198,18 @@
     if (!entryIds.length) return; if (!$('plot-dialog').open) $('plot-dialog').showModal(); $('plot-dataset-count').textContent = `Loading ${entryIds.length} selected dataset${entryIds.length === 1 ? '' : 's'}…`; $('plot-error').hidden = true; $('plot-empty').hidden = false; $('plot-dataset').replaceChildren(); state.plotData = [];
     try {
       for (const entryId of entryIds) {
-        const [dataResult, metadataResult] = await Promise.all([
-          window.tiledBrowser.fullData(serverName, entryId), window.tiledBrowser.metadata(serverName, entryId)
-        ]);
+        const metadataResult = await window.tiledBrowser.metadata(serverName, entryId);
+        const isContainer = metadataResult.success && metadataResult.data?.data?.attributes?.structure_family === 'container';
+        const dataResult = isContainer
+          ? await window.tiledBrowser.containerData(serverName, entryId)
+          : await window.tiledBrowser.fullData(serverName, entryId);
         if (!dataResult.success) throw new Error(`${entryId}: ${dataResult.error}`);
-        const parsed = window.TiledPlotUtils.buildDataset(dataResult.data, metadataResult.success ? metadataResult.data : null);
+        const structure = isContainer ? { structure: { variables: dataResult.data.structures } } : metadataResult.success ? metadataResult.data : null;
+        const parsed = window.TiledPlotUtils.buildDataset(dataResult.data, structure);
         if (parsed.variables.some(variable => variable.numeric)) state.plotData.push({ id: entryId, ...parsed });
       }
       if (!state.plotData.length) throw new Error('None of the selected entries contains plottable numeric array data.');
-      state.plotData.forEach((dataset, index) => { const option = document.createElement('option'); option.value = index; option.textContent = dataset.id; $('plot-dataset').append(option); }); $('plot-dataset-count').textContent = `${state.plotData.length} plottable selected dataset${state.plotData.length === 1 ? '' : 's'}`; populatePlotControls(); drawPlot();
+      refreshPlotDatasets(); populatePlotControls(); drawPlot();
     } catch (error) { $('plot-error').textContent = error.message || 'Unable to load selected Tiled data.'; $('plot-error').hidden = false; }
   }
   async function plotSelected() {
@@ -210,7 +217,22 @@
     const result = await window.tiledBrowser.openPlot(serverName, entryIds);
     if (!result.success) showError(result.error || 'Unable to open the Tiled plot window.');
   }
-  function activePlotDataset() { return state.plotData[Number($('plot-dataset').value) || 0]; }
+  function activePlotDataset() { const value = $('plot-dataset').value; return value === '' ? undefined : state.plotData[Number(value)]; }
+  function rgbImageVariable(dataset) { return dataset?.variables.find(variable => window.TiledPlotUtils.rgbImage(variable)); }
+  function imageMode() { return $('plot-mode').value === 'image'; }
+  function refreshPlotDatasets() {
+    const selectedId = activePlotDataset()?.id;
+    const datasets = imageMode() ? state.plotData.filter(rgbImageVariable) : state.plotData;
+    $('plot-dataset').replaceChildren();
+    datasets.forEach(dataset => {
+      const option = document.createElement('option'); option.value = state.plotData.indexOf(dataset); option.textContent = dataset.id;
+      $('plot-dataset').append(option);
+    });
+    if (datasets.some(dataset => dataset.id === selectedId)) $('plot-dataset').value = String(state.plotData.indexOf(datasets.find(dataset => dataset.id === selectedId)));
+    $('plot-dataset-count').textContent = `${datasets.length} ${imageMode() ? 'RGB image' : 'plottable'} selected dataset${datasets.length === 1 ? '' : 's'}`;
+    $('plot-axis-controls').hidden = imageMode();
+    $('plot-z-color').closest('label').hidden = imageMode();
+  }
   function axisVariableSelect(axis) { return $(`plot-${axis}-variable`); }
   function axisComponentSelect(axis) { return $(`plot-${axis}-component`); }
   function variableByName(dataset, name) { return dataset?.variables.find(variable => variable.name === name); }
@@ -255,22 +277,31 @@
     if (!x || !y || x.values.length !== image.xDimension.size || y.values.length !== image.yDimension.size) throw new Error('Image mode requires X and Y coordinates matching the image columns and rows.');
     window.Plotly.react('plot-widget', [{ type: 'heatmap', z: image.values, x: x.values, y: y.values, colorscale: 'Viridis', colorbar: { title: image.label }, hovertemplate: 'x=%{x}<br>y=%{y}<br>z=%{z}<extra></extra>' }], plotLayout(image.label, { x: x.label, y: y.label }), { responsive: true, displayModeBar: true });
   }
+  function renderRgbImage(variable) {
+    const image = window.TiledPlotUtils.rgbImage(variable);
+    if (!image) throw new Error('Image mode requires an RGB array with shape pixels_x × pixels_y × 3.');
+    window.Plotly.react('plot-widget', [{ type: 'image', z: image.values, hovertemplate: 'x=%{x}<br>y=%{y}<extra></extra>' }], { title: image.label, margin: { t: 40, b: 25, l: 25, r: 25 } }, { responsive: true, displayModeBar: true });
+  }
   function drawPlot() {
     const dataset = activePlotDataset(); if (!dataset || !window.Plotly) return;
-    $('plot-error').hidden = true; const x = resolvePlotAxis('x'); const y = resolvePlotAxis('y'); const z = resolvePlotAxis('z'); const zVariable = variableByName(dataset, axisVariableSelect('z').value); const selectedMode = $('plot-mode').value; const color = $('plot-z-color').checked;
+    $('plot-error').hidden = true; const selectedMode = $('plot-mode').value;
     try {
-      if (color) {
-        try { renderColorPlot(x, y, z); }
-        catch (error) { $('plot-z-color').checked = false; showPlotError(`${error.message} Color was disabled; attempting 3D.`); renderThreeDimensional(x, y, z); }
-      } else if (selectedMode === 'image' || (selectedMode === 'auto' && window.TiledPlotUtils.imagePlane(zVariable))) renderImagePlot(x, y, zVariable);
-      else renderThreeDimensional(x, y, z);
+      if (selectedMode === 'image') renderRgbImage(rgbImageVariable(dataset));
+      else {
+        const x = resolvePlotAxis('x'); const y = resolvePlotAxis('y'); const z = resolvePlotAxis('z'); const zVariable = variableByName(dataset, axisVariableSelect('z').value); const color = $('plot-z-color').checked;
+        if (color) {
+          try { renderColorPlot(x, y, z); }
+          catch (error) { $('plot-z-color').checked = false; showPlotError(`${error.message} Color was disabled; attempting 3D.`); renderThreeDimensional(x, y, z); }
+        } else if (selectedMode === 'auto' && window.TiledPlotUtils.imagePlane(zVariable)) renderImagePlot(x, y, zVariable);
+        else renderThreeDimensional(x, y, z);
+      }
       $('plot-empty').hidden = true;
     } catch (error) { window.Plotly.purge('plot-widget'); showPlotError(error.message || 'Unable to render the selected plot.'); $('plot-empty').hidden = false; }
   }
   function clearAll() { state.filters = {}; $('query-rows').replaceChildren(); addQuery(); resetPagination(); load(); }
   function closePlot() { $('plot-dialog').close(); if (standalonePlotEntries.length) window.close(); }
   function setup() {
-    $('apply-filters-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-filters-button').addEventListener('click', () => { state.filters = {}; state.distinctValues = {}; resetPagination(); renderFilters(); }); $('add-query-button').addEventListener('click', () => addQuery()); $('search-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-search-button').addEventListener('click', clearAll); $('refresh-button').addEventListener('click', load); $('previous-page').addEventListener('click', () => { const previous = state.pageHistory.pop(); if (!previous) return; state.cursor = previous.cursor; state.offset = previous.offset; load(); }); $('next-page').addEventListener('click', () => { if (!state.nextCursor) return; state.pageHistory.push({ cursor: state.cursor, offset: state.offset }); state.cursor = state.nextCursor; state.offset += state.rows.length; load(); }); $('select-all-button').addEventListener('click', () => { state.rows.forEach(row => state.selected.add(row.id)); renderRows(); }); $('copy-entry-id-button').addEventListener('click', () => openCopy(`Copy Entry ID (${state.selected.size})`, selectedRows().map(row => row.id).join(', '))); $('copy-sample-uuid-button').addEventListener('click', () => openCopy(`Copy Sample UUID (${state.selected.size})`, selectedRows().map(row => row.sample_uuid).filter(Boolean).join(', '))); $('copy-button').addEventListener('click', async () => { await navigator.clipboard.writeText($('copy-text').value); }); $('plot-selected-btn').addEventListener('click', plotSelected); $('plot-dataset').addEventListener('change', () => { populatePlotControls(); drawPlot(); }); ['x', 'y', 'z'].forEach(axis => { axisVariableSelect(axis).addEventListener('change', () => { populateAxisComponent(axis); drawPlot(); }); axisComponentSelect(axis).addEventListener('change', drawPlot); }); $('plot-mode').addEventListener('change', drawPlot); $('plot-z-color').addEventListener('change', drawPlot); $('update-plot').addEventListener('click', drawPlot); [['close-metadata', 'metadata-dialog'], ['close-data', 'data-dialog'], ['close-copy', 'copy-dialog']].forEach(([button, dialog]) => $(button).addEventListener('click', () => $(dialog).close())); $('close-plot').addEventListener('click', closePlot); $('error-close').addEventListener('click', () => showError());
+    $('apply-filters-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-filters-button').addEventListener('click', () => { state.filters = {}; state.distinctValues = {}; resetPagination(); renderFilters(); }); $('add-query-button').addEventListener('click', () => addQuery()); $('search-button').addEventListener('click', () => { resetPagination(); load(); }); $('clear-search-button').addEventListener('click', clearAll); $('refresh-button').addEventListener('click', load); $('previous-page').addEventListener('click', () => { const previous = state.pageHistory.pop(); if (!previous) return; state.cursor = previous.cursor; state.offset = previous.offset; load(); }); $('next-page').addEventListener('click', () => { if (!state.nextCursor) return; state.pageHistory.push({ cursor: state.cursor, offset: state.offset }); state.cursor = state.nextCursor; state.offset += state.rows.length; load(); }); $('select-all-button').addEventListener('click', () => { state.rows.forEach(row => state.selected.add(row.id)); renderRows(); }); $('copy-entry-id-button').addEventListener('click', () => openCopy(`Copy Entry ID (${state.selected.size})`, selectedRows().map(row => row.id).join(', '))); $('copy-sample-uuid-button').addEventListener('click', () => openCopy(`Copy Sample UUID (${state.selected.size})`, selectedRows().map(row => row.sample_uuid).filter(Boolean).join(', '))); $('copy-button').addEventListener('click', async () => { await navigator.clipboard.writeText($('copy-text').value); }); $('plot-selected-btn').addEventListener('click', plotSelected); $('plot-dataset').addEventListener('change', () => { populatePlotControls(); drawPlot(); }); ['x', 'y', 'z'].forEach(axis => { axisVariableSelect(axis).addEventListener('change', () => { populateAxisComponent(axis); drawPlot(); }); axisComponentSelect(axis).addEventListener('change', drawPlot); }); $('plot-mode').addEventListener('change', () => { refreshPlotDatasets(); populatePlotControls(); drawPlot(); }); $('plot-z-color').addEventListener('change', drawPlot); $('update-plot').addEventListener('click', drawPlot); [['close-metadata', 'metadata-dialog'], ['close-data', 'data-dialog'], ['close-copy', 'copy-dialog']].forEach(([button, dialog]) => $(button).addEventListener('click', () => $(dialog).close())); $('close-plot').addEventListener('click', closePlot); $('error-close').addEventListener('click', () => showError());
   }
   document.addEventListener('DOMContentLoaded', () => { renderFilters(); renderColumnPicker(); addQuery(); setup(); if (standalonePlotEntries.length) { document.body.classList.add('plot-only'); plotEntries(standalonePlotEntries); } else load(); });
 })();

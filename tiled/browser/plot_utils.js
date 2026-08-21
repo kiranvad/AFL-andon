@@ -128,6 +128,11 @@
     return { values: variable.values, xDimension: variable.dims[1], yDimension: variable.dims[0], label: variable.name };
   }
 
+  function rgbImage(variable) {
+    if (!variable || !variable.numeric || variable.shape.length !== 3 || variable.shape[0] <= 0 || variable.shape[1] <= 0 || variable.shape[2] !== 3) return null;
+    return { values: variable.values, label: variable.name };
+  }
+
   function finitePoints(x, y, z) {
     if (!x || !y || !z || x.length !== y.length || x.length !== z.length) return null;
     const points = [];
@@ -142,6 +147,34 @@
   function preferredVariable(variables, excluded = []) {
     const eligible = variables.filter(variable => variable.numeric && variable.shape.length === 1 && !excluded.includes(variable.name));
     return eligible.find(variable => ['q', 'Q', 'x', 'index'].includes(variable.name)) || eligible[0] || null;
+  }
+
+  function structureSummary(structure) {
+    const root = structure && typeof structure === 'object' ? structure : {};
+    const variables = root.data_vars || root.variables || {};
+    const coordinates = root.coords || root.coordinates || root.components || {};
+    for (const [name, details] of Object.entries(variables)) {
+      if (details?.role === 'coordinate') { coordinates[name] = details; delete variables[name]; }
+    }
+    const sections = [['Data variables', variables], ['Components / coordinates', coordinates]];
+    const lines = [];
+    const shown = new Set();
+    for (const [title, entries] of sections) {
+      if (!entries || typeof entries !== 'object') continue;
+      const rows = Object.entries(entries).filter(([, value]) => value && typeof value === 'object');
+      if (!rows.length) continue;
+      lines.push(`${title}:`);
+      for (const [name, details] of rows) {
+        if (shown.has(name)) continue;
+        shown.add(name);
+        const dims = details.dims || details.dimensions || [];
+        const shape = details.shape || [];
+        const rawDtype = details.dtype || details.data_type || details.type;
+        const dtype = typeof rawDtype === 'object' && rawDtype ? ({ f: 'float', i: 'int', u: 'uint', b: 'bool', U: 'unicode' }[rawDtype.kind] || rawDtype.kind || 'unknown') + (rawDtype.kind === 'b' ? '' : rawDtype.itemsize ? rawDtype.itemsize * 8 : '') : rawDtype || 'unknown';
+        lines.push(`  ${name} (${Array.isArray(dims) ? dims.join(', ') : dims || 'scalar'})  shape: (${Array.isArray(shape) ? shape.join(', ') : shape || 'unknown'})  dtype: ${dtype}`);
+      }
+    }
+    return lines.length ? lines.join('\n') : 'No variable structure is available for this dataset.';
   }
 
   function recommendPlot(variable) {
@@ -184,5 +217,5 @@
     };
   }
 
-  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, imagePlane, finitePoints, preferredVariable, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
+  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, imagePlane, rgbImage, finitePoints, preferredVariable, structureSummary, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
 });

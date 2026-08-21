@@ -200,7 +200,7 @@ async function tiledFullData(serverName, entryId) {
   return response.json();
 }
 
-async function tiledContainerData(serverName, entryId) {
+async function tiledContainerArrays(serverName, entryId) {
   const baseUrl = getTiledBaseUrl(serverName);
   const entryPath = await getTiledEntryPath(serverName, entryId);
   const headers = await getTiledRequestHeaders(serverName);
@@ -208,10 +208,26 @@ async function tiledContainerData(serverName, entryId) {
   searchUrl.searchParams.set('page[limit]', '100');
   searchUrl.searchParams.append('fields', 'structure');
   searchUrl.searchParams.append('fields', 'structure_family');
+  searchUrl.searchParams.append('fields', 'specs');
   const catalogResponse = await fetch(searchUrl, { headers });
   if (!catalogResponse.ok) throw new Error(`Tiled container search failed (${catalogResponse.status}): ${await catalogResponse.text()}`);
   const catalog = await catalogResponse.json();
-  const items = Array.isArray(catalog.data) ? catalog.data.filter(item => item?.attributes?.structure_family === 'array') : [];
+  return Array.isArray(catalog.data) ? catalog.data.filter(item => item?.attributes?.structure_family === 'array') : [];
+}
+
+function containerStructures(items) {
+  return Object.fromEntries(items.map(item => {
+    const structure = item.attributes?.structure || {};
+    const specs = item.attributes?.specs || [];
+    const role = specs.some(spec => spec?.name === 'xarray_coord') ? 'coordinate' : 'variable';
+    return [item.id, { ...structure, role }];
+  }));
+}
+
+async function tiledContainerData(serverName, entryId) {
+  const baseUrl = getTiledBaseUrl(serverName);
+  const headers = await getTiledRequestHeaders(serverName);
+  const items = await tiledContainerArrays(serverName, entryId);
   const values = await Promise.all(items.map(async item => {
     const fullLink = item?.links?.full;
     if (!fullLink) throw new Error(`Missing data link for ${item.id}`);
@@ -224,8 +240,12 @@ async function tiledContainerData(serverName, entryId) {
   }));
   return {
     data: Object.fromEntries(values),
-    structures: Object.fromEntries(items.map(item => [item.id, item.attributes?.structure || {}]))
+    structures: containerStructures(items)
   };
+}
+
+async function tiledContainerStructure(serverName, entryId) {
+  return { structures: containerStructures(await tiledContainerArrays(serverName, entryId)) };
 }
 
 async function tiledDistinct(serverName, field, filters = {}) {
@@ -706,6 +726,15 @@ ipcMain.handle('tiled-container-data', async (_event, serverName, entryId) => {
     return { success: true, data: await tiledContainerData(serverName, entryId) };
   } catch (error) {
     log.warn(`tiled-container-data failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('tiled-container-structure', async (_event, serverName, entryId) => {
+  try {
+    return { success: true, data: await tiledContainerStructure(serverName, entryId) };
+  } catch (error) {
+    log.warn(`tiled-container-structure failed: ${error.message}`);
     return { success: false, error: error.message };
   }
 });

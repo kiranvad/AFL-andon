@@ -19,6 +19,47 @@ test('builds a rectangular image plane and filters aligned points', () => {
   assert.equal(plots.finitePoints([1], [2, 3], [4]), null);
 });
 
+test('recognizes only RGB arrays as image-mode datasets', () => {
+  const dataset = plots.buildDataset({ rgb: [[[255, 0, 0], [0, 255, 0]]], scalar: [[1, 2], [3, 4]], rgba: [[[1, 2, 3, 4]]] });
+  assert.ok(plots.rgbImage(dataset.variables.find(variable => variable.name === 'rgb')));
+  assert.equal(plots.rgbImage(dataset.variables.find(variable => variable.name === 'scalar')), null);
+  assert.equal(plots.rgbImage(dataset.variables.find(variable => variable.name === 'rgba')), null);
+});
+
+test('summarizes dataset structure without including attributes', () => {
+  const summary = plots.structureSummary({
+    data_vars: { signal: { dims: ['sample', 'component'], shape: [2, 3], dtype: 'float64', attrs: { units: 'ignored' } } },
+    coords: { component: { dims: ['component'], shape: [3], dtype: '<U8', attrs: { note: 'ignored' } } }
+  });
+  assert.match(summary, /signal \(sample, component\)  shape: \(2, 3\)  dtype: float64/);
+  assert.match(summary, /component \(component\)  shape: \(3\)  dtype: <U8/);
+  assert.doesNotMatch(summary, /ignored|units|note/);
+});
+
+test('summarizes Tiled container arrays and separates coordinates', () => {
+  const summary = plots.structureSummary({ variables: {
+    img_rgb: { dims: ['height', 'width', 'rgb_channel'], shape: [350, 300, 3], data_type: { kind: 'u', itemsize: 1 } },
+    rgb_channel: { role: 'coordinate', dims: ['rgb_channel'], shape: [3], data_type: { kind: 'U', itemsize: 4 } }
+  } });
+  assert.match(summary, /img_rgb \(height, width, rgb_channel\)  shape: \(350, 300, 3\)  dtype: uint8/);
+  assert.match(summary, /Components \/ coordinates:[\s\S]*rgb_channel \(rgb_channel\)  shape: \(3\)  dtype: unicode32/);
+});
+
+test('builds plottable variables from a Tiled xarray container payload', () => {
+  const dataset = plots.buildDataset({ data: {
+    img_rgb: [[[1, 2, 3], [4, 5, 6]]], mask: [[true, false]], avg_rgb: [10, 20, 30]
+  }, structures: {
+    img_rgb: { dims: ['height', 'width', 'rgb_channel'], shape: [1, 2, 3], data_type: { kind: 'u', itemsize: 1 } },
+    mask: { dims: ['height', 'width'], shape: [1, 2], data_type: { kind: 'b', itemsize: 1 } },
+    avg_rgb: { dims: ['channel'], shape: [3], data_type: { kind: 'f', itemsize: 8 } }
+  } }, { structure: { variables: {
+    img_rgb: { dims: ['height', 'width', 'rgb_channel'], shape: [1, 2, 3] },
+    mask: { dims: ['height', 'width'], shape: [1, 2] }, avg_rgb: { dims: ['channel'], shape: [3] }
+  } } });
+  assert.deepEqual(dataset.variables.map(variable => variable.name), ['img_rgb', 'mask', 'avg_rgb']);
+  assert.ok(plots.rgbImage(dataset.variables.find(variable => variable.name === 'img_rgb')));
+});
+
 test('recommends plots and slices leading dimensions deterministically', () => {
   const dataset = plots.buildDataset({ time: [0, 1], y: [10, 20], x: [1, 2], image: [[[1, 2], [3, 4]], [[5, 6], [7, 8]]] });
   const image = dataset.variables.find(variable => variable.name === 'image');
