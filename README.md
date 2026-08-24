@@ -35,6 +35,12 @@ Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
 unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
 errors are written to the application terminal log rather than the card.
 
+The **All Logs** sidebar view records each screen log's byte boundary just
+before Start or Restart, then opens a continuous SSH follow stream as soon as
+the Screen session exists. It captures startup and later output without polling
+a fixed-size tail or loading older history. Streams continue while the view is
+hidden and close after a successful Stop.
+
 When the window is closed from the GUI, Andon asks for confirmation before it
 sends the normal stop command to every launcher started or restarted during
 that Andon session. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers

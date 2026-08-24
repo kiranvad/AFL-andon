@@ -546,7 +546,7 @@ class SSHOperations {
     return { success: true, configPath: remotePath };
   }
 
-  async startServer(serverName) {
+  async startServer(serverName, options = {}) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
     
@@ -639,6 +639,11 @@ class SSHOperations {
       return { success: false, error: 'Neither server_module nor server_script specified in config' };
     }
 
+    let launchContext;
+    if (typeof options.onBeforeLaunch === 'function') {
+      launchContext = await options.onBeforeLaunch();
+    }
+
     log.info(`${serverName}: Executing start command`);
     log.debug(`${serverName}: Command: ${startCommand}`);
     const result = await this.executeCommand(serverName, startCommand);
@@ -660,6 +665,12 @@ class SSHOperations {
         log.error(`${serverName}: Command output:\n${result.output}`);
       }
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
+    }
+
+    // The screen and its logfile now exist. Start observers before health
+    // checks so startup output is not lost while waiting for HTTP readiness.
+    if (typeof options.onLaunched === 'function') {
+      await options.onLaunched(launchContext);
     }
     
     const health = await this.waitForServerHealth(
@@ -688,7 +699,7 @@ class SSHOperations {
       return { success: false, error, health };
     }
 
-    log.info(`${serverName}: Server started, passed health check, and is detached`);
+    log.info(`${serverName}: Server started, passed health check, and screen session is active`);
     return { ...result, health };
   }
 
@@ -754,7 +765,7 @@ class SSHOperations {
     return result;
   }
 
-  async restartServer(serverName) {
+  async restartServer(serverName, options = {}) {
     log.info(`Restarting server: ${serverName}`);
     const stopResult = await this.stopServer(serverName);
     if (!stopResult.success && !stopResult.sshDown) {
@@ -763,7 +774,7 @@ class SSHOperations {
     }
     
     log.debug(`${serverName}: Stop complete, starting server`);
-    const startResult = await this.startServer(serverName);
+    const startResult = await this.startServer(serverName, options);
     
     if (startResult.success) {
       log.info(`${serverName}: Server restarted successfully`);
@@ -919,6 +930,83 @@ class SSHOperations {
     }
     
     return result;
+  }
+
+  async getServerLogSize(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) return { success: false, error: `Server not found: ${serverName}` };
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const result = await this.executeCommand(serverName, `wc -c < ${logPath} 2>/dev/null || printf 0`, 10000);
+    if (!result.success) return result;
+    const size = Number.parseInt(String(result.output || '').trim(), 10);
+    return { success: true, size: Number.isSafeInteger(size) && size >= 0 ? size : 0 };
+  }
+
+  async streamServerLog(serverName, startOffset, handlers = {}) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const hasOffset = Number.isSafeInteger(startOffset) && startOffset >= 0;
+    const offset = hasOffset ? startOffset : 0;
+    const command = hasOffset ? `tail -c +${offset + 1} -F ${logPath}` : `tail -n 0 -F ${logPath}`;
+
+    const { conn } = await this.connectWithAvailableKeys(serverName, 10000, {
+      keepaliveInterval: 10000,
+      keepaliveCountMax: 3
+    });
+
+    return new Promise((resolve, reject) => {
+      let channel;
+      let intentionalClose = false;
+      let closed = false;
+      const controller = {
+        offset: hasOffset ? offset : null,
+        close() {
+          intentionalClose = true;
+          try { channel?.close(); } catch (_) { /* Already closed. */ }
+          try { conn.end(); } catch (_) { /* Already closed. */ }
+        }
+      };
+      const reportClose = (error = null) => {
+        if (closed) return;
+        closed = true;
+        if (!intentionalClose) handlers.onClose?.(error);
+      };
+
+      conn.on('error', error => {
+        if (!intentionalClose) handlers.onError?.(error);
+      });
+      conn.on('close', () => reportClose());
+      conn.exec(command, (error, stream) => {
+        if (error) {
+          conn.end();
+          reject(error);
+          return;
+        }
+        channel = stream;
+        stream.setEncoding('utf8');
+        stream.on('data', data => {
+          if (controller.offset !== null) controller.offset += Buffer.byteLength(data, 'utf8');
+          handlers.onData?.(data);
+        });
+        stream.on('error', streamError => handlers.onError?.(streamError));
+        stream.stderr.on('data', data => {
+          const message = String(data).trim();
+          if (/file truncated/i.test(message)) {
+            controller.offset = 0;
+          } else if (message && !/has appeared; following/i.test(message)) {
+            handlers.onError?.(new Error(message));
+          }
+        });
+        stream.on('close', () => {
+          conn.end();
+          reportClose();
+        });
+        resolve(controller);
+      });
+    });
   }
 
   async joinServer(serverName) {

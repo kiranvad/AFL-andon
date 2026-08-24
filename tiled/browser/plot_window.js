@@ -5,7 +5,11 @@
   try { entryIds = JSON.parse(query.get('plotEntries') || '[]'); } catch (_) { entryIds = []; }
   const state = { datasets: [], slices: {}, mode: 'auto' };
   const $ = id => document.getElementById(id);
-  const plotVariable = () => activeDataset()?.variables.find(item => item.name === ($('plot-mode').value === 'scatter3d' ? $('axis-z').value : $('axis-color').value));
+  const plotVariable = () => {
+    const mode = $('plot-mode').value;
+    const axis = mode === 'scatter3d' ? 'z' : mode === 'line' ? 'y' : 'color';
+    return activeDataset()?.variables.find(item => item.name === $(`axis-${axis}`).value);
+  };
   const activeDataset = () => state.datasets[Number($('dataset-select').value) || 0];
   const showError = message => { $('plot-error').textContent = message || ''; $('plot-error').hidden = !message; };
 
@@ -21,19 +25,26 @@
 
   function renderControls() {
     const dataset = activeDataset(); if (!dataset) return;
-    const series = dataset.variables.filter(item => item.numeric && item.shape.length <= 2);
+    // Higher-rank numeric arrays remain useful outside Image mode: the slice
+    // controls reduce them to the rank required by the selected plot type.
+    const series = dataset.variables.filter(item => item.numeric && item.shape.length);
+    const imageVariable = window.TiledPlotUtils.preferredImageVariable(dataset.variables);
+    const imageVariables = dataset.variables.filter(item => window.TiledPlotUtils.imageRenderData(item, state.slices));
     const preferred = window.TiledPlotUtils.preferredVariable(series);
     const defaultZ = series.find(item => item.shape.length === 2) || series[0];
     const componentSeries = series.find(item => window.TiledPlotUtils.axisComponentOptions(item).length >= 3);
     for (const axis of ['x', 'y', 'z', 'color']) {
-      const defaultVariable = componentSeries?.name || (axis === 'x' ? preferred?.name : defaultZ?.name);
-      options($(`axis-${axis}`), series.map(item => ({ value: item.name, label: item.name })), $(`axis-${axis}`).value || defaultVariable);
+      const choices = $('plot-mode').value === 'image' && axis === 'color' ? imageVariables : series;
+      const defaultVariable = $('plot-mode').value === 'image' && axis === 'color'
+        ? imageVariable?.name
+        : componentSeries?.name || (axis === 'x' ? preferred?.name : defaultZ?.name);
+      options($(`axis-${axis}`), choices.map(item => ({ value: item.name, label: item.name })), $(`axis-${axis}`).value || defaultVariable);
       const axisVariable = dataset.variables.find(item => item.name === $(`axis-${axis}`).value);
       const components = window.TiledPlotUtils.axisComponentOptions(axisVariable);
       const componentSelect = $(`axis-${axis}-component`);
       const initialComponent = components[['x', 'y', 'z', 'color'].indexOf(axis)]?.value || components[0]?.value;
       options(componentSelect, components.length ? components : [{ value: '', label: 'Not applicable' }], componentSelect.value || initialComponent);
-      componentSelect.disabled = !axisVariable || axisVariable.shape.length <= 1;
+      componentSelect.disabled = !axisVariable || axisVariable.shape.length <= 1 || !components.length;
     }
     const is3d = $('plot-mode').value === 'scatter3d';
     const isLine = $('plot-mode').value === 'line';
@@ -41,8 +52,13 @@
     $('color-axis-control').hidden = isLine || (is3d && !$('color-enabled').checked);
     $('color-toggle-control').hidden = !is3d;
     const selected = plotVariable(); if (!selected) return;
-    const rank = ['heatmap', 'image', 'contour'].includes($('plot-mode').value) ? 2 : 1;
-    const retained = selected.dims.slice(-Math.min(rank, selected.dims.length)).map(dim => dim.name);
+    const isRgbImage = $('plot-mode').value === 'image' && Boolean(window.TiledPlotUtils.rgbImage(selected));
+    $('x-axis-control').hidden = isRgbImage;
+    $('y-axis-control').hidden = isRgbImage;
+    const rank = $('plot-mode').value === 'image' && window.TiledPlotUtils.rgbImage(selected)
+      ? 3
+      : ['heatmap', 'image', 'contour'].includes($('plot-mode').value) ? 2 : 1;
+    const retained = window.TiledPlotUtils.sliceToRank(selected, rank, state.slices)?.dims.map(dim => dim.name) || [];
     const sliceContainer = $('slice-controls'); sliceContainer.replaceChildren();
     selected.dims.filter(dim => !retained.includes(dim.name)).forEach(dim => {
       const label = document.createElement('label'); label.className = 'slice-control'; label.textContent = `Slice ${dim.name}`;
@@ -68,7 +84,16 @@
     return compact.reduced;
   }
   function surfacePlot(kind) {
-    const selected = window.TiledPlotUtils.sliceToRank(plotVariable(), 2, state.slices); if (!selected || !Array.isArray(selected.values?.[0])) throw new Error(`${kind} requires a rectangular 2D color/value variable.`);
+    const variable = plotVariable();
+    const image = kind === 'image' ? window.TiledPlotUtils.imageRenderData(variable, state.slices) : null;
+    if (image?.kind === 'rgb') {
+      window.Plotly.react('plot-widget', [{ type: 'image', z: image.values, name: image.label, hovertemplate: 'x=%{x}<br>y=%{y}<extra></extra>' }], { margin: { t: 35, b: 50, l: 60, r: 20 }, xaxis: { title: image.xDimension?.name || 'x', constrain: 'domain' }, yaxis: { title: image.yDimension?.name || 'y', scaleanchor: 'x' } }, { responsive: true, displayModeBar: true });
+      return false;
+    }
+    const selected = image?.kind === 'scalar'
+      ? { values: image.values, dims: [image.yDimension, image.xDimension] }
+      : window.TiledPlotUtils.sliceToRank(variable, 2, state.slices);
+    if (!selected || !Array.isArray(selected.values?.[0])) throw new Error(`${kind} requires a rectangular 2D color/value variable.`);
     const [yDim, xDim] = selected.dims;
     const selectedX = valuesForAxis('x'); const selectedY = valuesForAxis('y');
     const xUsesSelection = selectedX.length === xDim?.size; const yUsesSelection = selectedY.length === yDim?.size;
@@ -145,11 +170,16 @@
       state.datasets = results.filter(dataset => dataset.variables.some(item => item.numeric));
       if (!state.datasets.length) throw new Error('The selected entries contain no numeric arrays.');
       options($('dataset-select'), state.datasets.map((dataset, index) => ({ value: index, label: dataset.id })), '0'); $('plot-status').textContent = `${state.datasets.length} selected dataset${state.datasets.length === 1 ? '' : 's'} loaded`;
+      $('plot-mode').value = window.TiledPlotUtils.defaultPlotMode(activeDataset()?.variables || []);
       renderExplorer(); draw();
     } catch (error) { showError(error.message || 'Unable to load Tiled data.'); }
   }
   document.addEventListener('DOMContentLoaded', () => {
-    $('dataset-select').addEventListener('change', () => { state.slices = {}; renderExplorer(); draw(); });
+    $('dataset-select').addEventListener('change', () => {
+      state.slices = {};
+      $('plot-mode').value = window.TiledPlotUtils.defaultPlotMode(activeDataset()?.variables || []);
+      renderExplorer(); draw();
+    });
     ['plot-mode', 'color-enabled', 'axis-x', 'axis-y', 'axis-z', 'axis-color', 'axis-x-component', 'axis-y-component', 'axis-z-component', 'axis-color-component'].forEach(id => $(id).addEventListener('change', () => { renderControls(); draw(); }));
     $('close-window').addEventListener('click', () => window.close()); load();
   });

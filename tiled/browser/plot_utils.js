@@ -130,7 +130,31 @@
 
   function rgbImage(variable) {
     if (!variable || !variable.numeric || variable.shape.length !== 3 || variable.shape[0] <= 0 || variable.shape[1] <= 0 || variable.shape[2] !== 3) return null;
-    return { values: variable.values, label: variable.name };
+    return { values: variable.values, xDimension: variable.dims[1], yDimension: variable.dims[0], label: variable.name };
+  }
+
+  function preferredImageVariable(variables) {
+    return variables.find(variable => rgbImage(variable)) || variables.find(variable => imagePlane(variable)) || null;
+  }
+
+  function defaultPlotMode(variables) {
+    if (preferredImageVariable(variables)) return 'image';
+    const variable = preferredVariable(variables) || variables.find(item => item.numeric);
+    return recommendPlot(variable).mode === 'line' ? 'line' : 'scatter3d';
+  }
+
+  function imageRenderData(variable, sliceIndexes = {}) {
+    const rgb = rgbImage(variable);
+    if (rgb) return { kind: 'rgb', ...rgb };
+    const selected = sliceToRank(variable, 2, sliceIndexes);
+    if (!variable?.numeric || !selected || selected.dims.length !== 2 || !Array.isArray(selected.values?.[0])) return null;
+    return {
+      kind: 'scalar',
+      values: selected.values,
+      xDimension: selected.dims[1],
+      yDimension: selected.dims[0],
+      label: variable.name
+    };
   }
 
   function finitePoints(x, y, z) {
@@ -190,9 +214,16 @@
     let values = variable.values;
     const dims = [...variable.dims];
     while (Array.isArray(values) && dims.length > rank) {
-      const dimension = dims.shift();
+      // For RGB images, remove the channel dimension first. This makes a
+      // rank-2 request a full color-channel plane and a rank-1 request a
+      // spatial row. Other arrays retain the established leading-dimension
+      // slicing behavior.
+      const rgbChannel = rgbImage(variable) ? dims.findIndex(dimension => /rgb.*channel|channel.*rgb/i.test(dimension.name)) : -1;
+      const dimensionIndex = rgbChannel >= 0 ? rgbChannel : 0;
+      const [dimension] = dims.splice(dimensionIndex, 1);
       const index = Math.max(0, Math.min(dimension.size - 1, Number(sliceIndexes[dimension.name]) || 0));
-      values = values[index];
+      const select = (items, depth) => depth === 0 ? items[index] : items.map(item => select(item, depth - 1));
+      values = select(values, dimensionIndex);
     }
     return { values, dims };
   }
@@ -217,5 +248,5 @@
     };
   }
 
-  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, imagePlane, rgbImage, finitePoints, preferredVariable, structureSummary, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
+  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, imagePlane, rgbImage, preferredImageVariable, defaultPlotMode, imageRenderData, finitePoints, preferredVariable, structureSummary, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
 });

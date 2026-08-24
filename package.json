@@ -10,7 +10,8 @@
     "build:win": "electron-builder --win nsis",
     "build:mac": "electron-builder --mac dmg",
     "build:linux": "electron-builder --linux AppImage",
-    "check-package": "node scripts/validate-package.js"
+    "check-package": "node scripts/validate-package.js",
+    "test": "node --test test/*.test.js tiled/browser/*.test.js"
   },
   "repository": {
     "type": "git",

@@ -13,6 +13,9 @@ let sshOps;
 // Track attempts, not only healthy launches. A detached `screen` can exist
 // before the health check fails, and it must be stopped when Andon exits.
 const andonManagedServers = new Set();
+const sessionLogStreams = new Map();
+const sessionLogEvents = [];
+let sessionLogSequence = 0;
 let shutdownPromise;
 let shutdownComplete = false;
 let fatalShutdownInProgress = false;
@@ -26,6 +29,146 @@ const ICON_PATH_PNG = path.join(__dirname, 'assets', 'icons', 'png', '256x256.pn
 
 function getAppIconPath() {
   return process.platform === 'darwin' ? ICON_PATH_MAC : ICON_PATH_PNG;
+}
+
+function sendSessionLogEvent(entry, payload) {
+  const message = { sequence: ++sessionLogSequence, serverName: entry.serverName, ...payload };
+  sessionLogEvents.push(message);
+  if (sessionLogEvents.length > 20000) sessionLogEvents.splice(0, sessionLogEvents.length - 20000);
+  if (entry.owner && !entry.owner.isDestroyed()) {
+    entry.owner.send('server-log-stream', message);
+  }
+}
+
+function scheduleSessionLogReconnect(entry) {
+  if (!entry.desired || entry.reconnectTimer) return;
+  entry.reconnectTimer = setTimeout(() => {
+    entry.reconnectTimer = null;
+    openSessionLogStream(entry);
+  }, 3000);
+}
+
+async function openSessionLogStream(entry) {
+  if (!entry.desired || entry.connecting || entry.controller) return;
+  entry.connecting = true;
+  const generation = ++entry.generation;
+  try {
+    const controller = await sshOps.streamServerLog(entry.serverName, entry.startOffset, {
+      onData(data) {
+        if (!entry.desired || generation !== entry.generation) return;
+        if (!entry.receivedData) {
+          entry.receivedData = true;
+          log.info(`Receiving session log stream for ${entry.serverName}`);
+        }
+        if (entry.active) {
+          sendSessionLogEvent(entry, { type: 'data', data, observedAt: Date.now() });
+        } else {
+          entry.pending.push({ data, observedAt: Date.now() });
+          entry.pendingSize += data.length;
+          while (entry.pendingSize > 2_000_000 && entry.pending.length > 1) {
+            entry.pendingSize -= entry.pending.shift().data.length;
+          }
+        }
+      },
+      onError(error) {
+        const shouldNotify = entry.active && entry.lastStatus !== 'failed';
+        entry.lastStatus = 'failed';
+        entry.error = error.message;
+        if (shouldNotify) {
+          sendSessionLogEvent(entry, { type: 'status', status: 'failed', error: error.message });
+        }
+      },
+      onClose(error) {
+        if (!entry.desired || generation !== entry.generation) return;
+        entry.startOffset = entry.controller?.offset ?? entry.startOffset;
+        entry.controller = null;
+        const shouldNotify = entry.active && entry.lastStatus !== 'failed';
+        entry.lastStatus = 'failed';
+        entry.error = error?.message || entry.error || 'SSH log stream closed';
+        if (shouldNotify) {
+          sendSessionLogEvent(entry, { type: 'status', status: 'failed', error: entry.error });
+        }
+        scheduleSessionLogReconnect(entry);
+      }
+    });
+    if (!entry.desired || generation !== entry.generation) {
+      controller.close();
+      return;
+    }
+    entry.controller = controller;
+    entry.startOffset = controller.offset;
+    log.info(`Session log stream connected for ${entry.serverName} at byte ${entry.startOffset}`);
+    entry.lastStatus = 'connected';
+    entry.error = '';
+    if (entry.active) {
+      sendSessionLogEvent(entry, { type: 'status', status: 'connected' });
+    }
+  } catch (error) {
+    if (entry.desired && generation === entry.generation) {
+      entry.lastStatus = 'failed';
+      entry.error = error.message;
+      if (entry.active) {
+        sendSessionLogEvent(entry, { type: 'status', status: 'failed', error: error.message });
+      }
+      scheduleSessionLogReconnect(entry);
+    }
+  } finally {
+    entry.connecting = false;
+  }
+}
+
+async function beginSessionLogStream(serverName, owner, startOffset) {
+  stopSessionLogStream(serverName, false);
+  const entry = {
+    serverName,
+    owner,
+    desired: true,
+    active: false,
+    connecting: false,
+    controller: null,
+    reconnectTimer: null,
+    generation: 0,
+    pending: [],
+    pendingSize: 0,
+    lastStatus: 'connecting',
+    error: '',
+    startOffset,
+    receivedData: false
+  };
+  sessionLogStreams.set(serverName, entry);
+  await openSessionLogStream(entry);
+}
+
+function activateSessionLogStream(serverName, owner) {
+  const entry = sessionLogStreams.get(serverName);
+  if (!entry) return { success: false, error: 'No session log stream exists for this server' };
+  if (entry.owner !== owner) return { success: false, error: 'Log stream belongs to another renderer' };
+  entry.active = true;
+  const result = {
+    success: true,
+    status: entry.controller ? 'connected' : 'failed',
+    error: entry.controller ? '' : (entry.error || 'Connecting to log stream'),
+    chunks: entry.pending
+  };
+  entry.pending = [];
+  entry.pendingSize = 0;
+  log.debug(`Activated session log stream for ${serverName} with ${result.chunks.length} buffered chunk(s)`);
+  return result;
+}
+
+function stopSessionLogStream(serverName, notify = true) {
+  const entry = sessionLogStreams.get(serverName);
+  if (!entry) return;
+  entry.desired = false;
+  entry.generation += 1;
+  clearTimeout(entry.reconnectTimer);
+  entry.controller?.close();
+  if (notify && entry.active) sendSessionLogEvent(entry, { type: 'status', status: 'stopped' });
+  sessionLogStreams.delete(serverName);
+}
+
+function stopAllSessionLogStreams() {
+  for (const serverName of [...sessionLogStreams.keys()]) stopSessionLogStream(serverName, false);
 }
 
 function isTiledLauncher(serverName) {
@@ -381,6 +524,7 @@ async function stopManagedServersForShutdown() {
         log.error(`Shutdown: failed to stop ${serverNames[index]}:`, result.reason?.message || result.reason);
       }
     });
+    stopAllSessionLogStreams();
   })().finally(() => {
     shutdownComplete = true;
   });
@@ -503,18 +647,25 @@ ipcMain.handle('start-server', async (event, serverName) => {
   // and bind a port before a later health/detach check returns failure.
   andonManagedServers.add(serverName);
   try {
-    const result = await sshOps.startServer(serverName);
+    stopSessionLogStream(serverName, false);
+    const result = await sshOps.startServer(serverName, {
+      onBeforeLaunch: () => sshOps.getServerLogSize(serverName),
+      onLaunched: boundary => beginSessionLogStream(serverName, event.sender, boundary?.success ? boundary.size : null)
+    });
     if (result.sshDown) {
+      stopSessionLogStream(serverName, false);
       log.warn(`start-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
     if (!result.success) {
+      stopSessionLogStream(serverName, false);
       log.error(`start-server: ${serverName} failed to start: ${result.error || 'Unknown error'}`);
       return result;
     }
     log.info(`start-server: ${serverName} started successfully`);
     return result;
   } catch (error) {
+    stopSessionLogStream(serverName, false);
     log.error(`start-server: Error for ${serverName}:`, error.message);
     return { success: false, error: error.message };
   }
@@ -528,7 +679,10 @@ ipcMain.handle('stop-server', async (event, serverName) => {
       log.warn(`stop-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
-    if (result.success) andonManagedServers.delete(serverName);
+    if (result.success) {
+      andonManagedServers.delete(serverName);
+      stopSessionLogStream(serverName);
+    }
     log.info(`stop-server: ${serverName} stopped successfully`);
     return result;
   } catch (error) {
@@ -541,21 +695,40 @@ ipcMain.handle('restart-server', async (event, serverName) => {
   log.info(`IPC: restart-server requested for ${serverName}`);
   andonManagedServers.add(serverName);
   try {
-    const result = await sshOps.restartServer(serverName);
+    stopSessionLogStream(serverName, false);
+    const result = await sshOps.restartServer(serverName, {
+      onBeforeLaunch: () => sshOps.getServerLogSize(serverName),
+      onLaunched: boundary => beginSessionLogStream(serverName, event.sender, boundary?.success ? boundary.size : null)
+    });
     if (result.sshDown) {
+      stopSessionLogStream(serverName, false);
       log.warn(`restart-server: SSH is down for ${serverName}`);
       return { success: false, sshDown: true };
     }
     if (!result.success) {
+      stopSessionLogStream(serverName, false);
       log.error(`restart-server: ${serverName} failed to restart: ${result.error || 'Unknown error'}`);
       return result;
     }
     log.info(`restart-server: ${serverName} restarted successfully`);
     return result;
   } catch (error) {
+    stopSessionLogStream(serverName, false);
     log.error(`restart-server: Error for ${serverName}:`, error.message);
     return { success: false, error: error.message };
   }
+});
+
+ipcMain.handle('activate-server-log-stream', (event, serverName) => {
+  return activateSessionLogStream(serverName, event.sender);
+});
+
+ipcMain.handle('get-session-log-events', (_event, afterSequence = 0) => {
+  const cursor = Number.isSafeInteger(afterSequence) && afterSequence >= 0 ? afterSequence : 0;
+  return {
+    events: sessionLogEvents.filter(item => item.sequence > cursor),
+    latestSequence: sessionLogSequence
+  };
 });
 
 ipcMain.handle('get-server-status', async (event, serverName) => {

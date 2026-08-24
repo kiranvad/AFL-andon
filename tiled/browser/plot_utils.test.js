@@ -21,9 +21,41 @@ test('builds a rectangular image plane and filters aligned points', () => {
 
 test('recognizes only RGB arrays as image-mode datasets', () => {
   const dataset = plots.buildDataset({ rgb: [[[255, 0, 0], [0, 255, 0]]], scalar: [[1, 2], [3, 4]], rgba: [[[1, 2, 3, 4]]] });
-  assert.ok(plots.rgbImage(dataset.variables.find(variable => variable.name === 'rgb')));
+  const rgb = dataset.variables.find(variable => variable.name === 'rgb');
+  assert.ok(plots.rgbImage(rgb));
+  assert.equal(plots.preferredImageVariable(dataset.variables), rgb);
+  assert.deepEqual(plots.imageRenderData(rgb), {
+    kind: 'rgb', values: [[[255, 0, 0], [0, 255, 0]]],
+    xDimension: rgb.dims[1], yDimension: rgb.dims[0], label: 'rgb'
+  });
   assert.equal(plots.rgbImage(dataset.variables.find(variable => variable.name === 'scalar')), null);
   assert.equal(plots.rgbImage(dataset.variables.find(variable => variable.name === 'rgba')), null);
+});
+
+test('prepares the supplied Tiled camera image structure as native RGB image data', () => {
+  const metadata = { data: { attributes: { structure: { variables: {
+    img_rgb: { dims: ['height', 'width', 'rgb_channel'], shape: [2, 2, 3] },
+    mask: { dims: ['height', 'width'], shape: [2, 2] }
+  } } } } };
+  const dataset = plots.buildDataset({ data: {
+    img_rgb: [[[166, 137, 126], [20, 30, 40]], [[50, 60, 70], [80, 90, 100]]],
+    mask: [[true, false], [false, true]]
+  } }, metadata);
+  const image = plots.imageRenderData(plots.preferredImageVariable(dataset.variables));
+  assert.equal(plots.defaultPlotMode(dataset.variables), 'image');
+  assert.equal(image.kind, 'rgb');
+  assert.equal(image.label, 'img_rgb');
+  assert.equal(image.yDimension.name, 'height');
+  assert.equal(image.xDimension.name, 'width');
+  assert.deepEqual(image.values[0][0], [166, 137, 126]);
+  assert.deepEqual(
+    plots.sliceToRank(plots.preferredImageVariable(dataset.variables), 2, { rgb_channel: 1 }).values,
+    [[137, 30], [60, 90]]
+  );
+  assert.deepEqual(
+    plots.sliceToRank(plots.preferredImageVariable(dataset.variables), 1, { height: 1, rgb_channel: 0 }).values,
+    [50, 80]
+  );
 });
 
 test('summarizes dataset structure without including attributes', () => {
