@@ -60,3 +60,30 @@ test('reports a failure when the log stream cannot be opened', async () => {
     /no screen session/
   );
 });
+
+test('sets a one-second GNU Screen logfile flush interval after launch', async () => {
+  const operations = new SSHOperations('/tmp/config', '/tmp/key');
+  operations.config = {
+    alpha: {
+      host: 'host',
+      username: 'user',
+      screen_name: 'Alpha Server',
+      server_script: '/opt/alpha/start.sh',
+      shell: 'bash'
+    }
+  };
+  operations.getRemoteOs = async () => 'linux';
+  const commands = [];
+  operations.executeCommand = async (_name, command) => {
+    commands.push(command);
+    return { success: true, output: '', code: 0 };
+  };
+  operations.waitForServerHealth = async () => ({ ok: true });
+  operations.ensureScreenDetached = async () => ({ ok: true });
+  operations.updateAndonRuntimeConfig = async () => ({ success: true });
+
+  const result = await operations.startServer('alpha');
+
+  assert.equal(result.success, true);
+  assert.equal(commands[1], "screen -S 'Alpha Server' -X logfile flush 1");
+});

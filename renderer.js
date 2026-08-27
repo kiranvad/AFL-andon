@@ -68,6 +68,7 @@ function ensureAllLogServer(serverName) {
 function addMergedLogEntries(entries) {
   if (!entries.length) return;
   mergedLogEntries = capEntries(mergedLogEntries.concat(entries), MAX_MERGED_LINES);
+  ipcRenderer.send('append-combined-log-entries', entries);
 }
 
 function formatObservationTime(value) {
@@ -834,8 +835,8 @@ function setActiveTab(name) {
 
 function openAndonPanel() {
   log.debug('Opening Andon panel');
-  const webview = document.getElementById('server-webview');
-  webview.src = '';
+  // Keep the webview loaded while it is hidden. Clearing src while a page is
+  // loading makes Electron reject GUEST_VIEW_MANAGER_CALL with ERR_ABORTED.
   setActiveTab('andon');
 }
 
@@ -855,14 +856,15 @@ function openServerWebview(serverName) {
     const browserUrl = pathToFileURL(path.join(__dirname, 'tiled', 'browser', 'index.html'));
     browserUrl.searchParams.set('server', serverName);
     log.debug(`Loading bundled Tiled browser: ${browserUrl}`);
-    webview.src = browserUrl.toString();
+    const url = browserUrl.toString();
+    if (webview.getAttribute('src') !== url) webview.src = url;
     activeTab = serverName;
     return;
   }
   const url = serverConfig.webview_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/`;
   log.debug(`Loading URL: ${url}`);
-  webview.src = url;
+  if (webview.getAttribute('src') !== url) webview.src = url;
   activeTab = serverName;
 }
 

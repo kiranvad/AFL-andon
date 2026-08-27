@@ -667,6 +667,22 @@ class SSHOperations {
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
     }
 
+    // GNU Screen buffers logfile output for 10 seconds by default. Reduce the
+    // flush interval so the combined logs view closely follows server output.
+    if (!isMacOs) {
+      const flushResult = await this.executeCommand(
+        serverName,
+        `screen -S ${shellQuote(serverConfig.screen_name)} -X logfile flush 1`,
+        5000
+      );
+      if (!flushResult.success || (flushResult.code !== 0 && flushResult.code !== null)) {
+        const error = flushResult.error || `command exited with code ${flushResult.code}`;
+        log.warn(`${serverName}: Could not set Screen logfile flush interval to 1 second: ${error}`);
+      } else {
+        log.debug(`${serverName}: Set Screen logfile flush interval to 1 second`);
+      }
+    }
+
     // The screen and its logfile now exist. Start observers before health
     // checks so startup output is not lost while waiting for HTTP readiness.
     if (typeof options.onLaunched === 'function') {

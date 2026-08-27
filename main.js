@@ -1,12 +1,14 @@
 // main.js
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const { createLogger, logFilePath } = require('./logger');
+const { CombinedLogWriter } = require('./combinedLog');
 const log = createLogger('main');
 
 const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
 const SSHOperations = require('./sshOperations');
+const { isExpectedWebviewNavigationAbort } = require('./electronErrors');
 
 let mainWindow;
 let sshOps;
@@ -16,6 +18,7 @@ const andonManagedServers = new Set();
 const sessionLogStreams = new Map();
 const sessionLogEvents = [];
 let sessionLogSequence = 0;
+const combinedLogWriter = new CombinedLogWriter();
 let shutdownPromise;
 let shutdownComplete = false;
 let fatalShutdownInProgress = false;
@@ -512,19 +515,20 @@ async function stopManagedServersForShutdown() {
   if (shutdownPromise) return shutdownPromise;
 
   shutdownPromise = (async () => {
-    if (!sshOps) return;
-
-    const serverNames = [...andonManagedServers];
-    log.info(`Stopping ${serverNames.length} Andon-managed server(s) before shutdown`);
-    const results = await Promise.allSettled(
-      serverNames.map(serverName => sshOps.stopServer(serverName))
-    );
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        log.error(`Shutdown: failed to stop ${serverNames[index]}:`, result.reason?.message || result.reason);
-      }
-    });
-    stopAllSessionLogStreams();
+    if (sshOps) {
+      const serverNames = [...andonManagedServers];
+      log.info(`Stopping ${serverNames.length} Andon-managed server(s) before shutdown`);
+      const results = await Promise.allSettled(
+        serverNames.map(serverName => sshOps.stopServer(serverName))
+      );
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          log.error(`Shutdown: failed to stop ${serverNames[index]}:`, result.reason?.message || result.reason);
+        }
+      });
+      stopAllSessionLogStreams();
+    }
+    await combinedLogWriter.flush();
   })().finally(() => {
     shutdownComplete = true;
   });
@@ -629,7 +633,14 @@ process.once('uncaughtException', error => {
   handleFatalError('Uncaught exception', error);
 });
 
-process.once('unhandledRejection', error => {
+process.on('unhandledRejection', error => {
+  // Electron can reject the internal GUEST_VIEW_MANAGER_CALL promise when a
+  // webview navigation is superseded. That is normal browser cancellation,
+  // not an Andon failure, and must never trigger remote-server shutdown.
+  if (isExpectedWebviewNavigationAbort(error)) {
+    log.debug(`Ignoring canceled webview navigation: ${error.url}`);
+    return;
+  }
   handleFatalError('Unhandled rejection', error);
 });
 
@@ -729,6 +740,12 @@ ipcMain.handle('get-session-log-events', (_event, afterSequence = 0) => {
     events: sessionLogEvents.filter(item => item.sequence > cursor),
     latestSequence: sessionLogSequence
   };
+});
+
+ipcMain.on('append-combined-log-entries', (_event, entries) => {
+  combinedLogWriter.append(entries).catch(error => {
+    log.error(`Could not write combined log ${combinedLogWriter.filePath}: ${error.message}`);
+  });
 });
 
 ipcMain.handle('get-server-status', async (event, serverName) => {
