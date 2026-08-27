@@ -24,6 +24,14 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
+function isLocalHost(host) {
+  const normalized = String(host || '').trim().toLowerCase();
+  return normalized === 'localhost' ||
+    normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '[::1]';
+}
+
 // `screen -ls` retains exited sessions until `screen -wipe` is run. Keep
 // those entries separate so a stale record is never reported as a live server.
 function parseScreenSessions(output) {
@@ -460,24 +468,98 @@ class SSHOperations {
 
   async ensureScreenDetached(serverName) {
     const screenName = this.config[serverName].screen_name;
-    // startServer already launches screen with -d -m.  Asking screen to
-    // detach it again fails when it is already detached, so only verify it.
-    const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
-    if (!statusResult.success) return { ok: false, reason: statusResult.error || 'could not verify screen state' };
-    const session = parseScreenSessions(statusResult.output)
-      .find(item => item.name === screenName && item.state !== 'dead');
+    const getSession = async () => {
+      const statusResult = await this.executeCommand(serverName, 'screen -ls', 5000);
+      if (!statusResult.success) {
+        return { error: statusResult.error || 'could not verify screen state' };
+      }
+      return {
+        session: parseScreenSessions(statusResult.output)
+          .find(item => item.name === screenName && item.state !== 'dead')
+      };
+    };
+
+    let { session, error } = await getSession();
+    if (error) return { ok: false, reason: error };
     if (!session) return { ok: false, reason: `screen session "${screenName}" exited` };
+    if (session.state === 'detached') return { ok: true };
+
+    if (session.state !== 'attached') {
+      return { ok: false, reason: `screen session is ${session.state}, not detached` };
+    }
+
+    // A user may have joined the session while the server was starting.  Send
+    // the screen command only in that case: `screen -X detach` errors for an
+    // already-detached session.
+    const detachResult = await this.executeCommand(
+      serverName,
+      `screen -S ${shellQuote(screenName)} -X detach`,
+      5000
+    );
+    if (!detachResult.success || (detachResult.code !== 0 && detachResult.code !== null)) {
+      return {
+        ok: false,
+        reason: detachResult.error || `screen detach command exited with code ${detachResult.code}`
+      };
+    }
+
+    ({ session, error } = await getSession());
+    if (error) return { ok: false, reason: error };
+    if (!session) return { ok: false, reason: `screen session "${screenName}" exited while detaching` };
     if (session.state !== 'detached') return { ok: false, reason: `screen session is ${session.state}, not detached` };
     return { ok: true };
   }
 
-  async startServer(serverName) {
+  async resolveModuleConfigPath(serverName, serverConfig) {
+    const localPath = serverConfig.config_file_location?.trim();
+    if (!localPath) return { success: true, configPath: null };
+
+    let content;
+    try {
+      content = await fs.readFile(localPath, 'utf8');
+    } catch (error) {
+      const message = error.code === 'ENOENT'
+        ? `Config file does not exist on this computer: ${localPath}`
+        : `Could not read config file ${localPath}: ${error.message}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+    log.info(`${serverName}: Read launcher config file from ${localPath} (${Buffer.byteLength(content, 'utf8')} bytes)`);
+
+    if (isLocalHost(serverConfig.host)) {
+      log.debug(`${serverName}: Using local config file ${localPath}`);
+      return { success: true, configPath: localPath };
+    }
+
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
+    const extension = path.extname(localPath);
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const remotePath = `${homePath}/.afl/configs/${safeServerName}.launch-config${extension}`;
+    const upload = await this.writeRemoteFile(serverConfig.host, remotePath, content);
+    if (!upload.success) {
+      const message = `Could not copy config file to ${serverConfig.host}: ${upload.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message };
+    }
+
+    log.info(`${serverName}: Copied local config file to ${remotePath}`);
+    return { success: true, configPath: remotePath };
+  }
+
+  async startServer(serverName, options = {}) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
     
     if (!serverConfig) {
       log.error(`Cannot start server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+
+    let launchConfigPath = null;
+    if (serverConfig.server_module || serverConfig.server_type === 'tiled') {
+      const configResult = await this.resolveModuleConfigPath(serverName, serverConfig);
+      if (!configResult.success) return configResult;
+      launchConfigPath = configResult.configPath;
     }
     
     // Detect remote OS to use appropriate screen options
@@ -504,6 +586,11 @@ class SSHOperations {
 
     if (serverConfig.server_module) {
       let command = `python -m ${serverConfig.server_module}`;
+      if (launchConfigPath) {
+        command += ` --config ${shellQuote(launchConfigPath)}`;
+        log.info(`${serverName}: Launching server with provided config file ${launchConfigPath}`);
+        log.debug(`${serverName}: Using config file ${launchConfigPath}`);
+      }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
       
       // Handle environment activation based on env_type
@@ -520,7 +607,25 @@ class SSHOperations {
         command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
       }
       
-      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci "${command}"`;
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -ci ${shellQuote(command)}`;
+    } else if (serverConfig.server_type === 'tiled') {
+      if (!launchConfigPath) {
+        return { success: false, error: 'Tiled requires a config file location.' };
+      }
+      // Tiled config files commonly use relative catalog/storage paths. Match
+      // tiled/start_tiled.sh by serving from the config file's directory.
+      const tiledConfigDirectory = path.dirname(launchConfigPath);
+      let command = `cd ${shellQuote(tiledConfigDirectory)} && tiled serve config ${shellQuote(launchConfigPath)}`;
+      // Keep the start path consistent with tiled/start_tiled.sh.
+      if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
+        command = `source ${shellQuote(path.join(serverConfig.virtualenv_path, 'bin', 'activate'))};${command}`;
+      } else {
+        command = `conda activate ${shellQuote(serverConfig.conda_env || 'afl_agent')};${command}`;
+      }
+      if (isMacOs) {
+        command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
+      }
+      startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell || 'bash'} -ci ${shellQuote(command)}`;
     } else if (serverConfig.server_script) {
       log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
       if (isMacOs) {
@@ -532,6 +637,11 @@ class SSHOperations {
     } else {
       log.error(`${serverName}: Neither server_module nor server_script specified`);
       return { success: false, error: 'Neither server_module nor server_script specified in config' };
+    }
+
+    let launchContext;
+    if (typeof options.onBeforeLaunch === 'function') {
+      launchContext = await options.onBeforeLaunch();
     }
 
     log.info(`${serverName}: Executing start command`);
@@ -555,6 +665,28 @@ class SSHOperations {
         log.error(`${serverName}: Command output:\n${result.output}`);
       }
       return { success: false, error: `Start command exited with code ${result.code}`, output: result.output };
+    }
+
+    // GNU Screen buffers logfile output for 10 seconds by default. Reduce the
+    // flush interval so the combined logs view closely follows server output.
+    if (!isMacOs) {
+      const flushResult = await this.executeCommand(
+        serverName,
+        `screen -S ${shellQuote(serverConfig.screen_name)} -X logfile flush 1`,
+        5000
+      );
+      if (!flushResult.success || (flushResult.code !== 0 && flushResult.code !== null)) {
+        const error = flushResult.error || `command exited with code ${flushResult.code}`;
+        log.warn(`${serverName}: Could not set Screen logfile flush interval to 1 second: ${error}`);
+      } else {
+        log.debug(`${serverName}: Set Screen logfile flush interval to 1 second`);
+      }
+    }
+
+    // The screen and its logfile now exist. Start observers before health
+    // checks so startup output is not lost while waiting for HTTP readiness.
+    if (typeof options.onLaunched === 'function') {
+      await options.onLaunched(launchContext);
     }
     
     const health = await this.waitForServerHealth(
@@ -583,7 +715,7 @@ class SSHOperations {
       return { success: false, error, health };
     }
 
-    log.info(`${serverName}: Server started, passed health check, and is detached`);
+    log.info(`${serverName}: Server started, passed health check, and screen session is active`);
     return { ...result, health };
   }
 
@@ -649,7 +781,7 @@ class SSHOperations {
     return result;
   }
 
-  async restartServer(serverName) {
+  async restartServer(serverName, options = {}) {
     log.info(`Restarting server: ${serverName}`);
     const stopResult = await this.stopServer(serverName);
     if (!stopResult.success && !stopResult.sshDown) {
@@ -658,7 +790,7 @@ class SSHOperations {
     }
     
     log.debug(`${serverName}: Stop complete, starting server`);
-    const startResult = await this.startServer(serverName);
+    const startResult = await this.startServer(serverName, options);
     
     if (startResult.success) {
       log.info(`${serverName}: Server restarted successfully`);
@@ -814,6 +946,83 @@ class SSHOperations {
     }
     
     return result;
+  }
+
+  async getServerLogSize(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) return { success: false, error: `Server not found: ${serverName}` };
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const result = await this.executeCommand(serverName, `wc -c < ${logPath} 2>/dev/null || printf 0`, 10000);
+    if (!result.success) return result;
+    const size = Number.parseInt(String(result.output || '').trim(), 10);
+    return { success: true, size: Number.isSafeInteger(size) && size >= 0 ? size : 0 };
+  }
+
+  async streamServerLog(serverName, startOffset, handlers = {}) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
+    const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
+    const hasOffset = Number.isSafeInteger(startOffset) && startOffset >= 0;
+    const offset = hasOffset ? startOffset : 0;
+    const command = hasOffset ? `tail -c +${offset + 1} -F ${logPath}` : `tail -n 0 -F ${logPath}`;
+
+    const { conn } = await this.connectWithAvailableKeys(serverName, 10000, {
+      keepaliveInterval: 10000,
+      keepaliveCountMax: 3
+    });
+
+    return new Promise((resolve, reject) => {
+      let channel;
+      let intentionalClose = false;
+      let closed = false;
+      const controller = {
+        offset: hasOffset ? offset : null,
+        close() {
+          intentionalClose = true;
+          try { channel?.close(); } catch (_) { /* Already closed. */ }
+          try { conn.end(); } catch (_) { /* Already closed. */ }
+        }
+      };
+      const reportClose = (error = null) => {
+        if (closed) return;
+        closed = true;
+        if (!intentionalClose) handlers.onClose?.(error);
+      };
+
+      conn.on('error', error => {
+        if (!intentionalClose) handlers.onError?.(error);
+      });
+      conn.on('close', () => reportClose());
+      conn.exec(command, (error, stream) => {
+        if (error) {
+          conn.end();
+          reject(error);
+          return;
+        }
+        channel = stream;
+        stream.setEncoding('utf8');
+        stream.on('data', data => {
+          if (controller.offset !== null) controller.offset += Buffer.byteLength(data, 'utf8');
+          handlers.onData?.(data);
+        });
+        stream.on('error', streamError => handlers.onError?.(streamError));
+        stream.stderr.on('data', data => {
+          const message = String(data).trim();
+          if (/file truncated/i.test(message)) {
+            controller.offset = 0;
+          } else if (message && !/has appeared; following/i.test(message)) {
+            handlers.onError?.(new Error(message));
+          }
+        });
+        stream.on('close', () => {
+          conn.end();
+          reportClose();
+        });
+        resolve(controller);
+      });
+    });
   }
 
   async joinServer(serverName) {

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tiled Plot Viewer</title><link rel="stylesheet" href="plot_window.css">
+</head>
+<body>
+  <header><div><h1>Tiled Plot Viewer</h1><p id="plot-status">Loading selected data…</p></div><button id="close-window" type="button">Close</button></header>
+  <main>
+    <aside aria-label="Dataset selector">
+      <h2>Dataset</h2><label>Select dataset<select id="dataset-select"></select></label>
+      <section id="controls" aria-label="Plot controls">
+        <h2>Plot configuration</h2>
+        <label>Plot type<select id="plot-mode"><option value="scatter3d">Scatter 3D</option><option value="scatter2d">Scatter 2D</option><option value="line">Line 1D</option><option value="contour">Contourf 2D</option><option value="heatmap">Heatmap</option><option value="image">Image</option></select></label>
+        <label id="color-toggle-control"><input id="color-enabled" type="checkbox"> Color points</label>
+        <div class="axis-grid"><fieldset id="x-axis-control"><legend>X axis</legend><label>Variable<select id="axis-x"></select></label><label>Component<select id="axis-x-component"></select></label></fieldset><fieldset id="y-axis-control"><legend>Y axis</legend><label>Variable<select id="axis-y"></select></label><label>Component<select id="axis-y-component"></select></label></fieldset><fieldset id="z-axis-control"><legend>Z axis</legend><label>Variable<select id="axis-z"></select></label><label>Component<select id="axis-z-component"></select></label></fieldset><fieldset id="color-axis-control"><legend>Image / color values</legend><label>Variable<select id="axis-color"></select></label><label>Component<select id="axis-color-component"></select></label></fieldset></div>
+      </section>
+      <section id="slice-controls" aria-label="Slice controls"></section>
+    </aside>
+    <section id="workspace">
+      <p id="plot-error" hidden role="alert"></p>
+      <p id="recommendation"></p><div id="plot-widget" aria-label="Interactive Tiled plot"></div><p id="downsample-note" hidden></p>
+    </section>
+  </main>
+  <script src="vendor/plotly.min.js"></script><script src="plot_utils.js"></script><script src="plot_window.js"></script>
+</body>
+</html>

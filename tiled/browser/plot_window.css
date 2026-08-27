@@ -1,0 +1,32 @@
+:root { color: #243447; font: 14px Arial, sans-serif; background: #f5f7fa; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button { padding: 7px 11px; color: #fff; cursor: pointer; background: #1677ad; border: 1px solid #1473a6; border-radius: 4px; }
+select { width: 100%; padding: 7px; background: #fff; border: 1px solid #b7c4cf; border-radius: 3px; }
+select:disabled { color: #7a8791; cursor: not-allowed; background: #edf1f4; border-color: #d5dce3; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; background: #fff; border-bottom: 1px solid #d5dce3; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 22px; font-weight: 500; }
+h2 { font-size: 14px; }
+header p, #recommendation, #downsample-note { margin-top: 4px; color: #667784; }
+main { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: calc(100vh - 72px); }
+aside { padding: 16px; overflow: auto; background: #fff; border-right: 1px solid #d5dce3; }
+aside label, #controls label { display: grid; gap: 4px; margin-bottom: 13px; font-weight: 600; color: #415364; }
+aside section { margin-top: 20px; }
+#controls h2 { margin-bottom: 10px; }
+#color-toggle-control { display: flex !important; align-items: center; gap: 6px; }
+#color-toggle-control input { margin: 0; }
+.axis-grid { display: grid; gap: 9px; }
+.axis-grid fieldset { min-width: 0; margin: 0; padding: 8px; border: 1px solid #d5dce3; border-radius: 4px; }
+.axis-grid legend { padding: 0 4px; font-weight: 600; color: #415364; }
+.axis-grid label { display: grid !important; gap: 4px; margin: 0 0 8px !important; }
+.axis-grid label:last-child { margin-bottom: 0 !important; }
+#workspace { min-width: 0; padding: 16px; }
+#slice-controls { display: grid; gap: 12px; }
+.slice-control { display: grid; gap: 4px; min-width: 0; }
+.slice-control span { color: #667784; }
+#plot-widget { min-height: 520px; background: #fff; border: 1px solid #d5dce3; }
+#plot-error { padding: 10px; margin-bottom: 10px; color: #87212d; background: #fff0f1; border: 1px solid #e6abb1; }
+#downsample-note { color: #8a5a00; }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #d5dce3; } #plot-widget { min-height: 380px; } }

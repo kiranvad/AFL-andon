@@ -35,6 +35,23 @@ Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
 unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
 errors are written to the application terminal log rather than the card.
 
+The **All Logs** sidebar view records each screen log's byte boundary just
+before Start or Restart, then opens a continuous SSH follow stream as soon as
+the Screen session exists. It captures startup and later output without polling
+a fixed-size tail or loading older history. Streams continue while the view is
+hidden and close after a successful Stop.
+
+The displayed combined entries are also saved for the full Andon session in
+`~/.afl/logs/combined/`. Each launch creates a separate file whose name
+contains Andon's startup timestamp, such as
+`andon-2026-08-25_14-03-07-042.log`. Clearing the sidebar does not remove
+entries from that file.
+
+When the window is closed from the GUI, Andon asks for confirmation before it
+sends the normal stop command to every launcher started or restarted during
+that Andon session. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers
+that were already running when Andon opened are not stopped.
+
 ## Prerequisites
 
 - **Node.js 20** or newer is required. Install via [nvm](https://github.com/nvm-sh/nvm) or your
@@ -77,11 +94,20 @@ Settings tab also provides buttons to change them at runtime.
 The Settings tab reads and writes one current configuration file at
 `~/.afl/configs/andon.config.json` (or the same path on the selected remote
 host). It does not modify AFL-automation's global `~/.afl/config.json` or
-embed driver custom configurations.
+embed driver custom configurations. The native Tiled browser may read the
+latest `tiled_api_key` from that global file as a read-only credential fallback
+when its selected Tiled YAML does not define `single_user_api_key`.
 
 When a launcher successfully starts or stops, Andon rewrites its current entry
 in the file's `launchers` object with the launcher details, `runtime_state`,
 and `started_at` or `stopped_at` timestamp. It does not retain prior snapshots.
+
+For a Module launcher, **Config file location** is a path on the computer
+running Andon. Andon verifies it before start. For a remote host, Andon copies
+the file to `~/.afl/configs/` on that host and starts the module with
+`--config` pointing to the copied file. For `localhost`, Andon uses the local
+path directly. Leaving the field empty preserves the module's default
+persistent configuration behavior.
 
 ## Localhost SSH Setup
 
@@ -134,11 +160,36 @@ that copy before starting it through Andon.
 2. Edit the copied `tiled_config.yml` if authenticated writes are required.
    Set a local `single_user_api_key` value under `authentication`; do not add
    that value to the repository or to `launchers.json`.
-3. In AFL-andon, create a Script launcher that points `Server Script` to the
-   copied `start_tiled.sh`. Use a unique screen name, set the HTTP port to
-   `8000`, and set `Status URL` to `http://<host>:8000/healthz`.
+3. In AFL-andon, create a **Tiled** launcher, select the copied
+   `tiled_config.yml` as its `Config file location`, use a unique screen name,
+   set the HTTP port to `8000`, and set `Status URL` to
+   `http://<host>:8000/healthz`.
 4. Start the launcher from Andon. The server's logs remain available through
    the **View Log** control.
+
+### Tiled browser tab
+
+Select **Tiled** as the server type and set **Config file location** to the
+local `tiled_config.yml` file. Choose either the `afl_agent` Conda environment
+or a virtualenv (pip/uv); Andon copies that file to a remote host when needed
+and launches `tiled serve config <file>`. Clicking this launcher's
+existing sidebar tab opens Andon's bundled Tiled database browser in the same
+webview. The browser automatically uses the `run_documents` catalog when it is
+present (matching the browser served by AFL drivers such as OT2 and RGBCamera)
+and otherwise reads the root catalog. The active catalog is shown beside the
+connection status. Results are shown in pages of 50 entries; **Next** and
+**Previous** follow the Tiled server's cursor links, so browsing continues
+through the full catalog. Use the **Columns** menu to choose which data columns
+appear in the table; **Select** and **Actions** always remain visible, and the
+column choices are saved locally. Filter choices are read from Tiled's
+distinct-metadata endpoint; selecting **Data** or **Metadata** on an entry
+reads only that entry. These are read-only requests.
+
+If the Tiled YAML includes `authentication.single_user_api_key`, Andon reads
+it from the selected config file and sends it only to that launcher's Tiled
+API; it is not stored in `launchers.json` or exposed to the browser page. If
+the YAML has no key, Andon falls back to the latest `tiled_api_key` in the
+local `~/.afl/config.json`.
 
 ## Building
 

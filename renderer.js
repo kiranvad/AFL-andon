@@ -1,9 +1,20 @@
 // renderer.js (Renderer process)
 const { ipcRenderer } = require('electron');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const JSONEditor = require('jsoneditor');
 const { createLogger } = require('./logger');
+const {
+  MAX_MERGED_LINES,
+  decodeLogChunk,
+  stripTerminalControl,
+  capEntries,
+  filterEntries,
+  stableServerColor,
+  isRoutineHealthLog
+} = require('./allLogs');
 
 const log = createLogger('renderer');
 
@@ -33,6 +44,205 @@ let currentServerName;
 let activeTab = null;
 let inactiveExpanded = false;
 const startedServers = new Set();
+const allLogServers = new Map();
+let mergedLogEntries = [];
+let allLogsPaused = false;
+const logChunkRemainders = new Map();
+let allLogsRenderTimer = null;
+let lastSessionLogSequence = 0;
+let allLogsSyncTimer = null;
+let allLogsSyncRunning = false;
+
+function ensureAllLogServer(serverName) {
+  if (!allLogServers.has(serverName)) {
+    allLogServers.set(serverName, {
+      enabled: true,
+      lifecycle: 'running',
+      connection: 'waiting',
+      error: ''
+    });
+  }
+  return allLogServers.get(serverName);
+}
+
+function addMergedLogEntries(entries) {
+  if (!entries.length) return;
+  mergedLogEntries = capEntries(mergedLogEntries.concat(entries), MAX_MERGED_LINES);
+  ipcRenderer.send('append-combined-log-entries', entries);
+}
+
+function formatObservationTime(value) {
+  return new Date(value).toLocaleTimeString([], {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    fractionalSecondDigits: 3
+  });
+}
+
+function renderAllLogFilters() {
+  const container = document.getElementById('all-logs-filters');
+  if (!container) return;
+  container.replaceChildren();
+  for (const [serverName, state] of allLogServers) {
+    const label = document.createElement('label');
+    label.className = `all-logs-filter ${state.lifecycle === 'stopped' ? 'stopped' : ''} ${state.connection === 'failed' ? 'failed' : ''}`;
+    label.title = state.lifecycle === 'stopped' ? 'Stopped; collected history is retained' : (state.error || 'Connected');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = state.enabled;
+    checkbox.addEventListener('change', () => {
+      state.enabled = checkbox.checked;
+      renderAllLogs();
+    });
+    const text = document.createElement('span');
+    text.textContent = `${serverName}${state.lifecycle === 'stopped' ? ' (stopped)' : ''}`;
+    text.style.color = stableServerColor(serverName);
+    label.append(checkbox, text);
+    container.appendChild(label);
+  }
+}
+
+function renderAllLogs() {
+  const output = document.getElementById('all-logs-output');
+  if (!output) return;
+  const keepAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 24;
+  const enabled = new Set([...allLogServers].filter(([, state]) => state.enabled).map(([name]) => name));
+  const search = document.getElementById('all-logs-search')?.value || '';
+  const entries = filterEntries(mergedLogEntries, enabled, search);
+  const fragment = document.createDocumentFragment();
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.id = 'all-logs-empty';
+    empty.textContent = allLogServers.size
+      ? 'No log lines match the current filters.'
+      : 'Start or restart a server to begin collecting logs.';
+    fragment.appendChild(empty);
+  } else {
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      row.className = `all-log-line${entry.type === 'system' ? ' all-log-system' : ''}`;
+      const time = document.createElement('span');
+      time.className = 'all-log-time';
+      time.textContent = `[${formatObservationTime(entry.observedAt)}] `;
+      const server = document.createElement('span');
+      server.className = 'all-log-server';
+      server.style.color = stableServerColor(entry.server);
+      server.textContent = `[${entry.server}] `;
+      row.append(time, server, document.createTextNode(entry.text));
+      fragment.appendChild(row);
+    }
+  }
+  output.replaceChildren(fragment);
+  if (document.getElementById('all-logs-autoscroll')?.checked && keepAtBottom) {
+    output.scrollTop = output.scrollHeight;
+  }
+}
+
+function updateAllLogsStatus(message) {
+  const status = document.getElementById('all-logs-status');
+  if (status) status.textContent = message;
+}
+
+function updateAllLogsStreamSummary() {
+  const running = [...allLogServers.values()].filter(state => state.lifecycle === 'running');
+  const connected = running.filter(state => state.connection === 'connected').length;
+  if (!running.length) {
+    updateAllLogsStatus(allLogsPaused ? 'Paused — no running servers' : 'No running servers');
+  } else {
+    updateAllLogsStatus(`${allLogsPaused ? 'Paused — ' : ''}${connected}/${running.length} streaming · ${mergedLogEntries.length.toLocaleString()} lines`);
+  }
+}
+
+function showAllLogsPanel() {
+  clearTimeout(allLogsRenderTimer);
+  allLogsRenderTimer = null;
+  renderAllLogFilters();
+  renderAllLogs();
+  updateAllLogsStreamSummary();
+}
+
+function scheduleAllLogsRender() {
+  if (activeTab !== 'all-logs' || allLogsPaused || allLogsRenderTimer) return;
+  allLogsRenderTimer = setTimeout(() => {
+    allLogsRenderTimer = null;
+    renderAllLogs();
+    updateAllLogsStreamSummary();
+  }, 50);
+}
+
+function handleServerLogStream({ serverName, type, data = '', status, error = '', reset = false, observedAt = Date.now() }) {
+  const state = ensureAllLogServer(serverName);
+  if (reset) logChunkRemainders.delete(serverName);
+  if (type === 'data') {
+    const decoded = decodeLogChunk(logChunkRemainders.get(serverName) || '', stripTerminalControl(data));
+    logChunkRemainders.set(serverName, decoded.remainder);
+    const entries = decoded.lines
+      .filter(text => !isRoutineHealthLog(serverName, config?.[serverName], text))
+      .map(text => ({ server: serverName, text, observedAt, type: 'log' }));
+    addMergedLogEntries(entries);
+  } else if (type === 'status') {
+    if (status === 'stopped') {
+      const remainder = logChunkRemainders.get(serverName) || '';
+      if (remainder && !isRoutineHealthLog(serverName, config?.[serverName], remainder)) {
+        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log' }]);
+      }
+      logChunkRemainders.delete(serverName);
+      state.lifecycle = 'stopped';
+      state.connection = 'stopped';
+    } else if (status === 'connected') {
+      if (state.connection === 'failed') {
+        addMergedLogEntries([{ server: serverName, text: 'Log connection recovered.', observedAt, type: 'system' }]);
+      }
+      state.lifecycle = 'running';
+      state.connection = 'connected';
+      state.error = '';
+    } else if (status === 'failed') {
+      if (state.connection !== 'failed' || state.error !== error) {
+        addMergedLogEntries([{ server: serverName, text: `Log connection failed: ${error}`, observedAt, type: 'system' }]);
+      }
+      state.connection = 'failed';
+      state.error = error;
+    }
+    renderAllLogFilters();
+  }
+  scheduleAllLogsRender();
+  if (type === 'status') updateAllLogsStreamSummary();
+}
+
+function receiveServerLogEvent(payload) {
+  if (payload.sequence) {
+    if (payload.sequence <= lastSessionLogSequence) return;
+    lastSessionLogSequence = payload.sequence;
+  }
+  handleServerLogStream(payload);
+}
+
+async function syncSessionLogEvents() {
+  if (allLogsSyncRunning) return;
+  allLogsSyncRunning = true;
+  try {
+    const result = await ipcRenderer.invoke('get-session-log-events', lastSessionLogSequence);
+    for (const event of result.events || []) receiveServerLogEvent(event);
+    lastSessionLogSequence = Math.max(lastSessionLogSequence, result.latestSequence || 0);
+  } catch (error) {
+    log.warn(`Could not synchronize live log events: ${error.message}`);
+  } finally {
+    allLogsSyncRunning = false;
+  }
+}
+
+function startAllLogsSync() {
+  clearInterval(allLogsSyncTimer);
+  syncSessionLogEvents();
+  allLogsSyncTimer = setInterval(syncSessionLogEvents, 250);
+}
+
+function stopAllLogsSync() {
+  clearInterval(allLogsSyncTimer);
+  allLogsSyncTimer = null;
+}
 
 async function joinServer(serverName) {
   log.info(`Joining server: ${serverName}`);
@@ -408,10 +618,47 @@ async function controlServer(serverName, action) {
       log.error(`${action} failed for ${serverName}:`, result.error || 'Unknown error');
     }
     if (result.success && (action === 'start' || action === 'restart')) {
+      const stream = await ipcRenderer.invoke('activate-server-log-stream', serverName);
+      handleServerLogStream({
+        serverName,
+        type: 'status',
+        status: stream.success ? stream.status : 'failed',
+        error: stream.error || '',
+        reset: true,
+        observedAt: Date.now()
+      });
+      for (const chunk of stream.chunks || []) {
+        handleServerLogStream({ serverName, type: 'data', ...chunk });
+      }
+      const startupRemainder = logChunkRemainders.get(serverName) || '';
+      if (startupRemainder && !isRoutineHealthLog(serverName, config?.[serverName], startupRemainder)) {
+        addMergedLogEntries([{
+          server: serverName,
+          text: startupRemainder,
+          observedAt: Date.now(),
+          type: 'log'
+        }]);
+        logChunkRemainders.delete(serverName);
+        scheduleAllLogsRender();
+      }
       startedServers.add(serverName);
+      const logState = ensureAllLogServer(serverName);
+      logState.lifecycle = 'running';
+      renderAllLogFilters();
       await updateServerStatus(serverName);
+      updateAllLogsStreamSummary();
     }
-    if (result.success && action === 'stop') startedServers.delete(serverName);
+    if (result.success && action === 'stop') {
+      startedServers.delete(serverName);
+      const logState = allLogServers.get(serverName);
+      if (logState) {
+        logState.lifecycle = 'stopped';
+        logState.connection = 'stopped';
+      }
+      renderAllLogFilters();
+      renderAllLogs();
+      updateAllLogsStreamSummary();
+    }
   } catch (error) {
     log.error(`Error during ${action} for ${serverName}:`, error.message);
   }
@@ -468,6 +715,18 @@ function createServerTabs() {
   andonLi.appendChild(andonIcon);
   andonLi.onclick = openAndonPanel;
   tabList.appendChild(andonLi);
+
+  const logsLi = document.createElement('li');
+  logsLi.className = 'tab-item';
+  logsLi.id = 'all-logs-tab';
+  logsLi.dataset.server = 'all-logs';
+  logsLi.title = 'All Logs';
+  const logsIcon = document.createElement('div');
+  logsIcon.className = 'tab-icon';
+  logsIcon.textContent = '≣';
+  logsLi.appendChild(logsIcon);
+  logsLi.onclick = () => setActiveTab('all-logs');
+  tabList.appendChild(logsLi);
   
   let activeCount = 0;
   Object.keys(config).forEach(serverName => {
@@ -529,6 +788,7 @@ function updateTabStatus(serverName, queueResult) {
 }
 
 function setActiveTab(name) {
+  const wasAllLogs = activeTab === 'all-logs';
   activeTab = name;
   log.debug(`Setting active tab: ${name}`);
   document.querySelectorAll('.tab-item').forEach(item => item.classList.remove('selected'));
@@ -537,25 +797,46 @@ function setActiveTab(name) {
   const andon = document.getElementById('andon-panel');
   const webviewContainer = document.getElementById('webview-container');
   const settings = document.getElementById('settings-panel');
+  const allLogs = document.getElementById('all-logs-panel');
   if (name === 'andon') {
     webviewContainer.style.display = 'none';
     settings.style.display = 'none';
+    allLogs.style.display = 'none';
     andon.style.display = 'block';
   } else if (name === 'settings') {
     andon.style.display = 'none';
     webviewContainer.style.display = 'none';
+    allLogs.style.display = 'none';
     settings.style.display = 'block';
+  } else if (name === 'all-logs') {
+    andon.style.display = 'none';
+    webviewContainer.style.display = 'none';
+    settings.style.display = 'none';
+    allLogs.style.display = 'flex';
   } else {
     andon.style.display = 'none';
     settings.style.display = 'none';
+    allLogs.style.display = 'none';
     webviewContainer.style.display = 'flex';
+  }
+  if (name === 'all-logs' && !wasAllLogs) {
+    allLogsPaused = false;
+    const pauseButton = document.getElementById('all-logs-pause');
+    if (pauseButton) pauseButton.textContent = 'Pause';
+    showAllLogsPanel();
+    startAllLogsSync();
+  }
+  if (name !== 'all-logs' && wasAllLogs) {
+    clearTimeout(allLogsRenderTimer);
+    allLogsRenderTimer = null;
+    stopAllLogsSync();
   }
 }
 
 function openAndonPanel() {
   log.debug('Opening Andon panel');
-  const webview = document.getElementById('server-webview');
-  webview.src = '';
+  // Keep the webview loaded while it is hidden. Clearing src while a page is
+  // loading makes Electron reject GUEST_VIEW_MANAGER_CALL with ERR_ABORTED.
   setActiveTab('andon');
 }
 
@@ -571,10 +852,19 @@ function openServerWebview(serverName) {
   const serverConfig = config[serverName];
   setActiveTab(serverName);
   const webview = document.getElementById('server-webview');
+  if (serverConfig.server_type === 'tiled' || String(serverName).trim().toLowerCase() === 'tiled') {
+    const browserUrl = pathToFileURL(path.join(__dirname, 'tiled', 'browser', 'index.html'));
+    browserUrl.searchParams.set('server', serverName);
+    log.debug(`Loading bundled Tiled browser: ${browserUrl}`);
+    const url = browserUrl.toString();
+    if (webview.getAttribute('src') !== url) webview.src = url;
+    activeTab = serverName;
+    return;
+  }
   const url = serverConfig.webview_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/`;
   log.debug(`Loading URL: ${url}`);
-  webview.src = url;
+  if (webview.getAttribute('src') !== url) webview.src = url;
   activeTab = serverName;
 }
 
@@ -689,9 +979,12 @@ function openServerModal(serverName = null) {
     form.elements['server-username'].value = server.username;
     form.elements['server-http-port'].value = server.httpPort;
     form.elements['server-screen-name'].value = server.screen_name;
-    form.elements['server-type'].value = server.server_script ? 'script' : 'module';
+    form.elements['server-type'].value = server.server_type === 'tiled'
+      ? 'tiled'
+      : (server.server_script ? 'script' : 'module');
     form.elements['server-script'].value = server.server_script || '';
     form.elements['server-module'].value = server.server_module || '';
+    form.elements['server-config-file-location'].value = server.config_file_location || '';
     form.elements['server-shell'].value = server.shell || 'bash';
     form.elements['server-env-type'].value = server.env_type || (server.conda_env ? 'conda' : 'pip');
     form.elements['server-conda-env'].value = server.conda_env || '';
@@ -710,6 +1003,7 @@ function openServerModal(serverName = null) {
     form.elements['server-device'].checked = false;
     form.elements['server-status-url'].value = '';
     form.elements['server-webview-url'].value = '';
+    form.elements['server-config-file-location'].value = '';
     form.elements['server-active'].checked = true;
     form.elements['server-env-type'].value = 'conda';
   }
@@ -723,6 +1017,14 @@ function updateServerTypeFields() {
   const serverType = document.getElementById('server-type').value;
   document.getElementById('script-group').style.display = serverType === 'script' ? 'block' : 'none';
   document.getElementById('module-group').style.display = serverType === 'module' ? 'block' : 'none';
+  const configInput = document.getElementById('server-config-file-location');
+  const isTiled = serverType === 'tiled';
+  configInput.required = isTiled;
+  configInput.placeholder = isTiled ? '/path/to/tiled_config.yml' : '/path/to/server-config.json';
+  document.getElementById('server-shell').closest('.form-group').style.display = isTiled ? 'none' : 'block';
+  document.getElementById('server-env-type').closest('.form-group').style.display = 'block';
+  document.getElementById('conda-group').style.display = document.getElementById('server-env-type').value === 'conda' ? 'block' : 'none';
+  document.getElementById('virtualenv-group').style.display = document.getElementById('server-env-type').value === 'pip' ? 'block' : 'none';
 }
 
 function updateEnvTypeFields() {
@@ -748,11 +1050,17 @@ async function handleServerFormSubmit(event) {
   };
 
   const serverType = form.elements['server-type'].value;
-  if (serverType === 'script') {
+  if (serverType === 'tiled') {
+    serverConfig.server_type = 'tiled';
+    serverConfig.shell = 'bash';
+  } else if (serverType === 'script') {
     serverConfig.server_script = form.elements['server-script'].value;
   } else {
     serverConfig.server_module = form.elements['server-module'].value;
   }
+
+  // Keep an empty value so an edit can explicitly clear a prior selection.
+  serverConfig.config_file_location = form.elements['server-config-file-location'].value.trim();
 
   const envType = form.elements['server-env-type'].value;
   serverConfig.env_type = envType;
@@ -799,6 +1107,7 @@ async function addServer(serverName, serverConfig) {
   await ipcRenderer.invoke('add-server', { serverName, serverConfig });
   await loadConfig();
   renderServers();
+  ipcRenderer.on('server-log-stream', (_event, payload) => receiveServerLogEvent(payload));
 }
 
  async function updateServer(serverName, serverConfig) {
@@ -984,6 +1293,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadConfig();
   renderServers();
 
+  // The preload exposes only read-only, Tiled-specific IPC calls. It is used
+  // by the bundled Tiled page; ordinary server webviews do not call it.
+  const webview = document.getElementById('server-webview');
+  webview.setAttribute('preload', pathToFileURL(path.join(__dirname, 'tiled-webview-preload.js')).toString());
+
   // Set up event listeners
   document.getElementById('add-server-btn').addEventListener('click', () => openServerModal());
   document.querySelector('.modal .close').addEventListener('click', closeServerModal);
@@ -1013,6 +1327,35 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.querySelector('.close-log').addEventListener('click', closeLogModal);
+
+  document.getElementById('all-logs-search').addEventListener('input', renderAllLogs);
+  document.getElementById('all-logs-pause').addEventListener('click', () => {
+    allLogsPaused = !allLogsPaused;
+    document.getElementById('all-logs-pause').textContent = allLogsPaused ? 'Resume' : 'Pause';
+    if (allLogsPaused) {
+      clearTimeout(allLogsRenderTimer);
+      allLogsRenderTimer = null;
+      updateAllLogsStreamSummary();
+    } else {
+      renderAllLogs();
+      updateAllLogsStreamSummary();
+    }
+  });
+  document.getElementById('all-logs-refresh').addEventListener('click', () => {
+    renderAllLogs();
+    updateAllLogsStreamSummary();
+  });
+  document.getElementById('all-logs-clear').addEventListener('click', () => {
+    mergedLogEntries = [];
+    renderAllLogs();
+    updateAllLogsStatus(allLogsPaused ? 'Paused — history cleared' : 'History cleared');
+  });
+  document.getElementById('all-logs-autoscroll').addEventListener('change', event => {
+    if (event.target.checked) {
+      const output = document.getElementById('all-logs-output');
+      output.scrollTop = output.scrollHeight;
+    }
+  });
 
   document.querySelector('.close-terminal').addEventListener('click', closeTerminalModal);
 
