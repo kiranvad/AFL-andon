@@ -9,6 +9,7 @@ const fs = require('fs').promises;
 const os = require('os');
 const SSHOperations = require('./sshOperations');
 const { isExpectedWebviewNavigationAbort } = require('./electronErrors');
+const { loadTiledProfile } = require('./tiled/profile');
 
 let mainWindow;
 let sshOps;
@@ -179,14 +180,26 @@ function isTiledLauncher(serverName) {
   return server?.server_type === 'tiled' || String(serverName || '').trim().toLowerCase() === 'tiled';
 }
 
-function getTiledBaseUrl(serverName) {
+async function getTiledLauncherProfile(serverName, options = {}) {
+  const server = sshOps?.config?.[serverName];
+  const configPath = server?.config_file_location?.trim();
+  if (!configPath) return null;
+  try {
+    return await loadTiledProfile(configPath, options);
+  } catch (error) {
+    throw new Error(`Could not read the Tiled profile ${configPath}: ${error.message}`);
+  }
+}
+
+async function getTiledBaseUrl(serverName) {
   if (!isTiledLauncher(serverName)) {
     throw new Error('Tiled browser access is only available for the Tiled launcher.');
   }
   const server = sshOps?.config?.[serverName];
   if (!server) throw new Error('The Tiled launcher is not configured.');
 
-  const rawUrl = server.webview_url || `http://${server.host}:${server.httpPort}/`;
+  const profile = await getTiledLauncherProfile(serverName, { loadApiKey: false });
+  const rawUrl = profile?.uri || server.webview_url || `http://${server.host}:${server.httpPort}/`;
   let baseUrl;
   try {
     baseUrl = new URL(rawUrl);
@@ -201,19 +214,8 @@ function getTiledBaseUrl(serverName) {
 
 async function getTiledRequestHeaders(serverName) {
   const server = sshOps?.config?.[serverName] || {};
-  const configPath = server.config_file_location?.trim();
-  let apiKey = '';
-  if (configPath) {
-    try {
-      const contents = await fs.readFile(configPath, 'utf8');
-      const match = contents.match(/^\s*single_user_api_key\s*:\s*([^#\r\n]+)/m);
-      if (match) {
-        apiKey = match[1].trim().replace(/^['"]|['"]$/g, '');
-      }
-    } catch (error) {
-      throw new Error(`Could not read the Tiled config file ${configPath}: ${error.message}`);
-    }
-  }
+  const profile = await getTiledLauncherProfile(serverName);
+  let apiKey = profile?.apiKey || '';
   // AFL stores its runtime Tiled credential in a timestamped configuration
   // history. Native Andon browser requests should use that existing key when
   // the launcher YAML intentionally omits credentials from version control.
@@ -245,11 +247,12 @@ function encodeTiledPath(pathValue) {
 
 async function getTiledCatalogPath(serverName) {
   const server = sshOps?.config?.[serverName] || {};
-  const configuredPath = normalizeTiledPath(server.tiled_catalog_path);
+  const profile = await getTiledLauncherProfile(serverName, { loadApiKey: false });
+  const configuredPath = normalizeTiledPath(profile?.catalogPath || server.tiled_catalog_path);
   if (configuredPath) return configuredPath;
   if (tiledCatalogPathCache.has(serverName)) return tiledCatalogPathCache.get(serverName);
 
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const probeUrl = new URL('api/v1/metadata/run_documents', baseUrl);
   const response = await fetch(probeUrl, { headers: await getTiledRequestHeaders(serverName) });
   if (response.ok) {
@@ -287,7 +290,7 @@ async function tiledSearch(serverName, {
   queries = [],
   filters = {}
 } = {}) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const catalogPath = await getTiledCatalogPath(serverName);
   const searchPath = catalogPath ? `api/v1/search/${encodeTiledPath(catalogPath)}` : 'api/v1/search/';
   const url = new URL(searchPath, baseUrl);
@@ -330,7 +333,7 @@ async function tiledSearch(serverName, {
 }
 
 async function tiledFullData(serverName, entryId) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const entryPath = await getTiledEntryPath(serverName, entryId);
   const headers = await getTiledRequestHeaders(serverName);
 
@@ -347,7 +350,7 @@ async function tiledFullData(serverName, entryId) {
 }
 
 async function tiledContainerArrays(serverName, entryId) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const entryPath = await getTiledEntryPath(serverName, entryId);
   const headers = await getTiledRequestHeaders(serverName);
   const searchUrl = new URL(`api/v1/search/${encodeTiledPath(entryPath)}`, baseUrl);
@@ -371,7 +374,7 @@ function containerStructures(items) {
 }
 
 async function tiledContainerData(serverName, entryId) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const headers = await getTiledRequestHeaders(serverName);
   const items = await tiledContainerArrays(serverName, entryId);
   const values = await Promise.all(items.map(async item => {
@@ -395,7 +398,7 @@ async function tiledContainerStructure(serverName, entryId) {
 }
 
 async function tiledDistinct(serverName, field, filters = {}) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const catalogPath = await getTiledCatalogPath(serverName);
   const distinctPath = catalogPath ? `api/v1/distinct/${encodeTiledPath(catalogPath)}` : 'api/v1/distinct/';
   const url = new URL(distinctPath, baseUrl);
@@ -416,7 +419,7 @@ async function tiledDistinct(serverName, field, filters = {}) {
 }
 
 async function tiledMetadata(serverName, entryId) {
-  const baseUrl = getTiledBaseUrl(serverName);
+  const baseUrl = await getTiledBaseUrl(serverName);
   const entryPath = await getTiledEntryPath(serverName, entryId);
   const url = new URL(`api/v1/metadata/${encodeTiledPath(entryPath)}`, baseUrl);
   const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
@@ -434,6 +437,16 @@ async function tiledDataPreview(serverName, entryId) {
     metadata: attributes.metadata || {},
     note: 'This is a dataset summary. Full array values are intentionally not loaded here; use Plot Selected to load data for visualization.'
   };
+}
+
+async function tiledPing(serverName) {
+  const baseUrl = await getTiledBaseUrl(serverName);
+  const url = new URL('api/v1/metadata/', baseUrl);
+  const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
+  if (!response.ok) {
+    return { ok: false, statusCode: response.status, reason: `HTTP ${response.status}`, url: url.toString() };
+  }
+  return { ok: true, statusCode: response.status, state: 'ready', url: url.toString() };
 }
 
 // Set default paths (use os.homedir() since app.getPath() isn't available at load time)
@@ -673,11 +686,32 @@ ipcMain.handle('start-server', async (event, serverName) => {
       log.error(`start-server: ${serverName} failed to start: ${result.error || 'Unknown error'}`);
       return result;
     }
-    log.info(`start-server: ${serverName} started successfully`);
+    if (result.degraded) {
+      log.warn(`start-server: ${serverName} started in degraded state: ${result.warning}`);
+    } else {
+      log.info(`start-server: ${serverName} started successfully`);
+    }
     return result;
   } catch (error) {
     stopSessionLogStream(serverName, false);
     log.error(`start-server: Error for ${serverName}:`, error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('has-session-ssh-password', (_event, serverName) => {
+  return { available: sshOps.hasSessionPassword(serverName) };
+});
+
+ipcMain.handle('set-session-ssh-password', (_event, serverName, password) => {
+  const server = sshOps.config[serverName];
+  if (server?.tiled_management?.authentication !== 'password') {
+    return { success: false, error: 'This launcher does not use password authentication.' };
+  }
+  try {
+    sshOps.setSessionPassword(serverName, password);
+    return { success: true };
+  } catch (error) {
     return { success: false, error: error.message };
   }
 });
@@ -875,6 +909,15 @@ ipcMain.handle('get-config', async () => {
 // These endpoints are intentionally restricted to a Tiled-type launcher (with
 // a legacy fallback for a launcher named "tiled"). The bundled browser uses them so it can read the Tiled catalog
 // without depending on an AFL driver or on browser CORS configuration.
+ipcMain.handle('tiled-ping', async (_event, serverName) => {
+  try {
+    return await tiledPing(serverName);
+  } catch (error) {
+    log.warn(`tiled-ping failed: ${error.message}`);
+    return { ok: false, reason: error.message };
+  }
+});
+
 ipcMain.handle('tiled-search', async (_event, serverName, options) => {
   try {
     return { success: true, data: await tiledSearch(serverName, options) };
@@ -1038,20 +1081,31 @@ ipcMain.handle('start-ssh-session', async (event, serverName) => {
       }
     });
 
-    log.debug(`start-ssh-session: SSH connection established for ${serverName} using ${keyPath}`);
+    log.debug(`start-ssh-session: SSH connection established for ${serverName}${keyPath ? ` using ${keyPath}` : ' using a session password'}`);
     
+    const dockerCompose = sshOps.isDockerComposeManaged(serverConfig);
+    const joinCommand = sshOps.getJoinCommand(serverName);
     const stream = await new Promise((resolve, reject) => {
-      conn.shell((err, stream) => {
+      const onStream = (err, openedStream) => {
         if (err) reject(err);
-        else resolve(stream);
-      });
+        else resolve(openedStream);
+      };
+      if (dockerCompose) conn.exec(joinCommand, { pty: { term: 'xterm' } }, onStream);
+      else conn.shell(onStream);
     });
 
     sshConnections[serverName] = { conn, stream };
     log.debug(`start-ssh-session: Shell opened for ${serverName}`);
 
+    let sudoPasswordPending = dockerCompose;
     stream.on('data', (data) => {
-      mainWindow.webContents.send('ssh-data', { serverName, data: data.toString() });
+      let text = data.toString();
+      if (sudoPasswordPending && text.includes(sshOps.getSudoPrompt())) {
+        sudoPasswordPending = false;
+        text = text.replace(sshOps.getSudoPrompt(), '');
+        stream.write(`${sshOps.getSessionPassword(serverName)}\n`);
+      }
+      if (text) mainWindow.webContents.send('ssh-data', { serverName, data: text });
     });
 
     stream.on('close', () => {
@@ -1059,10 +1113,12 @@ ipcMain.handle('start-ssh-session', async (event, serverName) => {
       closeSSHConnection(serverName);
     });
 
-    // Send the 'screen -x' command
-    const screenCmd = `screen -x ${serverConfig.screen_name}\n`;
-    log.debug(`start-ssh-session: Sending command: ${screenCmd.trim()}`);
-    stream.write(screenCmd);
+    // A Compose join is started directly as a PTY command so the sudo password
+    // can be supplied without echoing it into the interactive terminal.
+    if (!dockerCompose) {
+      log.debug(`start-ssh-session: Sending join command for ${serverName}`);
+      stream.write(`${joinCommand}\n`);
+    }
 
     log.info(`start-ssh-session: Successfully connected to ${serverName}`);
     return { success: true };

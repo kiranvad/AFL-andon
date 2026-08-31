@@ -34,6 +34,7 @@
     "@xterm/xterm": "^5.5.0",
     "electron-log": "^5.2.4",
     "fs-extra": "^11.3.0",
+    "js-yaml": "^4.1.0",
     "jsoneditor": "^10.2.0",
     "node-fetch": "^3.3.2",
     "ssh2": "^1.16.0"

@@ -651,6 +651,20 @@
             <div id="log-content"></div>
         </div>
     </div>
+    <div id="ssh-password-modal" class="modal">
+        <div class="modal-content">
+            <span class="close close-ssh-password">&times;</span>
+            <h2>NAS Authentication</h2>
+            <form id="ssh-password-form">
+                <div class="form-group">
+                    <label id="ssh-password-label" for="ssh-password-input">SSH password</label>
+                    <input type="password" id="ssh-password-input" autocomplete="current-password" required>
+                </div>
+                <button type="submit" class="form-submit">Continue</button>
+                <button type="button" id="ssh-password-cancel">Cancel</button>
+            </form>
+        </div>
+    </div>
      <div id="server-modal" class="modal">
         <div class="modal-content">
             <span class="close">&times;</span>

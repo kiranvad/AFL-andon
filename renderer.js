@@ -52,6 +52,50 @@ let allLogsRenderTimer = null;
 let lastSessionLogSequence = 0;
 let allLogsSyncTimer = null;
 let allLogsSyncRunning = false;
+let sshPasswordPromptResolve = null;
+
+function requestSshPassword(serverName) {
+  const modal = document.getElementById('ssh-password-modal');
+  const form = document.getElementById('ssh-password-form');
+  const input = document.getElementById('ssh-password-input');
+  const label = document.getElementById('ssh-password-label');
+  label.textContent = `SSH password for ${config[serverName].username}@${config[serverName].host}`;
+  input.value = '';
+  modal.style.display = 'block';
+  setTimeout(() => input.focus(), 0);
+
+  return new Promise(resolve => {
+    sshPasswordPromptResolve = resolve;
+    form.dataset.serverName = serverName;
+  });
+}
+
+function finishSshPasswordPrompt(password = null) {
+  const modal = document.getElementById('ssh-password-modal');
+  const input = document.getElementById('ssh-password-input');
+  modal.style.display = 'none';
+  input.value = '';
+  const resolve = sshPasswordPromptResolve;
+  sshPasswordPromptResolve = null;
+  resolve?.(password);
+}
+
+async function ensureSshPassword(serverName, forcePrompt = false) {
+  const server = config?.[serverName];
+  if (server?.tiled_management?.authentication !== 'password') return true;
+  if (!forcePrompt) {
+    const status = await ipcRenderer.invoke('has-session-ssh-password', serverName);
+    if (status.available) return true;
+  }
+  const password = await requestSshPassword(serverName);
+  if (password === null) return false;
+  const result = await ipcRenderer.invoke('set-session-ssh-password', serverName, password);
+  if (!result.success) {
+    alert(result.error || 'Could not set the SSH password.');
+    return false;
+  }
+  return true;
+}
 
 function ensureAllLogServer(serverName) {
   if (!allLogServers.has(serverName)) {
@@ -247,6 +291,7 @@ function stopAllLogsSync() {
 async function joinServer(serverName) {
   log.info(`Joining server: ${serverName}`);
   try {
+    if (!await ensureSshPassword(serverName)) return;
     // Close existing connection if any
     if (currentServerName) {
       log.debug(`Closing existing connection to ${currentServerName}`);
@@ -339,6 +384,9 @@ function closeTerminalModal() {
 async function loadConfig() {
   log.debug('Loading configuration');
   config = await ipcRenderer.invoke('get-config');
+  for (const [serverName, serverConfig] of Object.entries(config || {})) {
+    if (serverConfig.active && serverConfig.external_service) startedServers.add(serverName);
+  }
   const serverCount = Object.keys(config || {}).length;
   log.info(`Configuration loaded: ${serverCount} servers`);
 }
@@ -429,6 +477,15 @@ async function fetchQueueState(serverName) {
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
+  if (serverConfig.server_type === 'tiled') {
+    const result = await ipcRenderer.invoke('tiled-ping', serverName);
+    return {
+      ok: !!result?.ok,
+      state: result?.state || null,
+      url: result?.url || url,
+      reason: result?.reason || null
+    };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 500);
   try {
@@ -489,7 +546,21 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
   const httpStatusElement = document.getElementById(`${serverName}-http-status`);
   
   if (screenStatusElement) {
-    if (screenResult.sshDown) {
+    if (screenResult.authenticationRequired) {
+      screenStatusElement.textContent = 'AUTH REQUIRED';
+      screenStatusElement.className = 'status-indicator status-yellow';
+      screenStatusElement.title = 'Click Start and enter the NAS SSH password to enable management and status checks.';
+    } else if (screenResult.managementType === 'docker_compose') {
+      screenStatusElement.textContent = screenResult.status ? 'CONTAINER ACTIVE' : 'CONTAINER DOWN';
+      screenStatusElement.className = `status-indicator ${screenResult.status ? 'status-up' : 'status-down'}`;
+      screenStatusElement.title = screenResult.status
+        ? 'The configured Docker Compose service is running.'
+        : 'The configured Docker Compose service is not running.';
+    } else if (screenResult.external || config[serverName]?.external_service) {
+      screenStatusElement.textContent = 'EXTERNAL';
+      screenStatusElement.className = 'status-indicator status-up';
+      screenStatusElement.title = 'This service is monitored by Andon but managed outside Andon.';
+    } else if (screenResult.sshDown) {
       screenStatusElement.textContent = 'SSH DOWN';
       screenStatusElement.className = 'status-indicator status-down';
     } else if (screenResult.screenState === 'dead') {
@@ -512,13 +583,16 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
         : `SERVER ${state.toUpperCase()}`;
       httpStatusElement.className = 'status-indicator status-up';
     } else {
-      httpStatusElement.textContent = 'UNREACHABLE';
-      httpStatusElement.className = 'status-indicator status-down';
-      httpStatusElement.title = '';
+      const processActive = !!screenResult?.status;
+      httpStatusElement.textContent = processActive ? 'HTTP UNREACHABLE' : 'SERVER DOWN';
+      httpStatusElement.className = `status-indicator ${processActive ? 'status-yellow' : 'status-down'}`;
+      httpStatusElement.title = processActive
+        ? (queueResult.reason || 'The driver process is active, but its HTTP API is not reachable yet.')
+        : '';
     }
   }
 
-  updateTabStatus(serverName, queueResult);
+  updateTabStatus(serverName, queueResult, screenResult);
 }
 
 function showServerDownStatus(serverName) {
@@ -543,6 +617,9 @@ async function batchUpdateServerStatuses() {
     // Andon session. This avoids probing launchers that have not been started.
     const allByHost   = await ipcRenderer.invoke('get-servers-by-host');
     const startedByHost = {};
+
+    const externalServers = [...startedServers].filter(name => config[name]?.external_service);
+    await Promise.all(externalServers.map(name => updateServerStatus(name)));
 
     for (const [host, names] of Object.entries(allByHost)) {
       const startedNames = names.filter(name => startedServers.has(name));
@@ -607,11 +684,15 @@ async function batchUpdateServerStatuses() {
 
 async function controlServer(serverName, action) {
   log.info(`Controlling server ${serverName}: ${action}`);
-  showServerDownStatus(serverName);
   try {
+    if (!await ensureSshPassword(serverName, action === 'start' || action === 'restart')) return;
+    showServerDownStatus(serverName);
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
     if (result.success) {
       log.info(`${action} successful for ${serverName}`);
+    } else if (result.authenticationRequired) {
+      log.warn(`SSH authentication is required for ${serverName}`);
+      alert(`SSH authentication failed for ${serverName}. Click Start and enter the password again.`);
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
     } else {
@@ -668,6 +749,7 @@ async function controlServer(serverName, action) {
 async function viewServerLog(serverName) {
   log.info(`Viewing log for ${serverName}`);
   try {
+    if (!await ensureSshPassword(serverName)) return;
     const result = await ipcRenderer.invoke('get-server-log', serverName, 200); // Request 200 lines
     if (result.success) {
       log.debug(`Retrieved log for ${serverName}: ${result.output?.length || 0} bytes`);
@@ -683,6 +765,8 @@ async function viewServerLog(serverName) {
 
       // Scroll to the bottom
       logContent.scrollTop = logContent.scrollHeight;
+    } else if (result.authenticationRequired) {
+      alert(`SSH authentication is required for ${serverName}.`);
     } else if (result.sshDown) {
       log.warn(`SSH is down for ${serverName}`);
       alert(`Unable to get log: SSH is down for ${serverName}`);
@@ -759,12 +843,14 @@ function createServerTabs() {
   log.debug(`Created tabs for ${activeCount} active servers`);
 }
 
-function updateTabStatus(serverName, queueResult) {
+function updateTabStatus(serverName, queueResult, screenResult = {}) {
   const tab = document.querySelector(`.tab-item[data-server="${serverName}"] .tab-icon`);
   if (!tab) return;
   tab.classList.remove('status-green','status-blue','status-yellow','status-red');
   let cls = 'status-red';
-  if (queueResult.ok) {
+  if (!queueResult.ok && screenResult.status) {
+    cls = 'status-yellow';
+  } else if (queueResult.ok) {
     const serverCfg = config[serverName] || {};
     if (serverCfg.device) {
       cls = 'status-green';
@@ -1327,6 +1413,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.querySelector('.close-log').addEventListener('click', closeLogModal);
+  document.getElementById('ssh-password-form').addEventListener('submit', event => {
+    event.preventDefault();
+    finishSshPasswordPrompt(document.getElementById('ssh-password-input').value);
+  });
+  document.querySelector('.close-ssh-password').addEventListener('click', () => finishSshPasswordPrompt());
+  document.getElementById('ssh-password-cancel').addEventListener('click', () => finishSshPasswordPrompt());
 
   document.getElementById('all-logs-search').addEventListener('input', renderAllLogs);
   document.getElementById('all-logs-pause').addEventListener('click', () => {
@@ -1369,8 +1461,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const termModal = document.getElementById('terminal-modal');
 
     const logModal = document.getElementById('log-modal');
+    const passwordModal = document.getElementById('ssh-password-modal');
     if (event.target == logModal) {
       logModal.style.display = 'none';
+    }
+    if (event.target == passwordModal) {
+      finishSshPasswordPrompt();
     }
     if (event.target == termModal) {
       closeTerminalModal();
