@@ -6,7 +6,7 @@ const test = require('node:test');
 
 const SSHOperations = require('../sshOperations');
 
-test('a Docker Compose Tiled profile defines all lifecycle controls', async t => {
+test('a Docker Compose Tiled profile disconnects without stopping the service', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'andon-external-tiled-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
 
@@ -82,22 +82,31 @@ management:
     tiled_server: 'http://192.0.2.10:8000',
     tiled_api_key: 'test-secret'
   });
-  assert.equal((await operations.stopServer('aflnas_tiled')).success, true);
+  const commandCountBeforeStop = commands.length;
+  operations.clearSessionPassword('aflnas_tiled');
+  assert.deepEqual(await operations.stopServer('aflnas_tiled'), {
+    success: true,
+    disconnected: true,
+    status: false,
+    managementType: 'docker_compose',
+    screenState: 'disconnected'
+  });
+  assert.equal(commands.length, commandCountBeforeStop);
+  operations.setSessionPassword('aflnas_tiled', 'test-password');
   assert.equal((await operations.restartServer('aflnas_tiled')).success, true);
   assert.equal((await operations.getServerLog('aflnas_tiled')).success, true);
   assert.equal((await operations.joinServer('aflnas_tiled')).success, true);
-  assert.equal(commands.length, 6);
+  assert.equal(commands.length, 5);
   assert.ok(commands.every(command => command.startsWith("sudo -S -p '")));
   assert.match(commands[0], /docker compose ps --status running --quiet/);
   assert.match(commands[1], /test -d/);
   assert.match(commands[1], /docker compose config --services/);
   assert.match(commands[1], /docker compose up -d/);
-  assert.match(commands[2], /docker compose stop/);
-  assert.match(commands[3], /docker compose restart/);
-  assert.match(commands[4], /docker compose logs --tail=200/);
-  assert.match(commands[5], /docker compose exec/);
+  assert.match(commands[2], /docker compose restart/);
+  assert.match(commands[3], /docker compose logs --tail=200/);
+  assert.match(commands[4], /docker compose exec/);
   assert.ok(commandOptions.every(options => options.stdin === 'test-password\n'));
-  assert.equal(commandOptions[5].pty, true);
+  assert.equal(commandOptions[4].pty, true);
 
   await fs.writeFile(profilePath, 'uvicorn:\n  port: 8000\ntrees:\n  - path: /\n    tree: catalog\n');
   await operations.loadConfig();

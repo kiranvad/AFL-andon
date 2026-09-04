@@ -464,7 +464,7 @@ class SSHOperations {
 
     if (this.getAvailableSSHKeys().length === 0 && !this.hasSessionPassword(serverName)) {
       const passwordRequired = serverConfig.tiled_management?.authentication === 'password';
-      log.error(`No SSH credential available for ${serverName}`);
+      if (!options.quiet) log.error(`No SSH credential available for ${serverName}`);
       return {
         success: false,
         sshDown: !passwordRequired,
@@ -479,7 +479,7 @@ class SSHOperations {
     try {
       ({ conn } = await this.connectWithAvailableKeys(serverName, timeout));
     } catch (error) {
-      log.error(`${serverName}: SSH connection error:`, error.message);
+      if (!options.quiet) log.error(`${serverName}: SSH connection error:`, error.message);
       if (error.level) {
         log.debug(`${serverName}: Error level: ${error.level}`);
       }
@@ -494,7 +494,7 @@ class SSHOperations {
     return new Promise((resolve) => {
       const onExec = (err, stream) => {
         if (err) {
-          log.error(`${serverName}: Command execution failed:`, err.message);
+          if (!options.quiet) log.error(`${serverName}: Command execution failed:`, err.message);
           conn.end();
           resolve({ success: false, sshDown: true, error: err.message });
           return;
@@ -508,7 +508,7 @@ class SSHOperations {
           log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
           // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
           const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
-          if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+          if (code !== 0 && code !== null && !isScreenLsNoScreens && !options.quiet) {
             log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
           resolve({ success: true, output, code, signal });
@@ -747,7 +747,7 @@ class SSHOperations {
     return SUDO_PROMPT;
   }
 
-  executeDockerComposeCommand(serverName, args, timeout = 0) {
+  executeDockerComposeCommand(serverName, args, timeout = 0, options = {}) {
     const serverConfig = this.config[serverName];
     const password = this.getSessionPassword(serverName);
     if (!password) {
@@ -761,7 +761,7 @@ class SSHOperations {
       serverName,
       this.getSudoDockerComposeCommand(serverConfig, args),
       timeout,
-      { stdin: `${password}\n` }
+      { ...options, stdin: `${password}\n` }
     );
   }
 
@@ -1048,19 +1048,16 @@ class SSHOperations {
       return { success: false, error: 'Server not found' };
     }
     if (this.isDockerComposeManaged(serverConfig)) {
-      if (serverConfig.tiled_management.authentication === 'password' && !this.hasSessionPassword(serverName)) {
-        return {
-          success: false,
-          status: false,
-          authenticationRequired: true,
-          managementType: 'docker_compose',
-          screenState: 'unknown'
-        };
-      }
-      const management = serverConfig.tiled_management;
-      const result = await this.executeDockerComposeCommand(serverName, `stop ${shellQuote(management.service)}`);
-      if (result.success && (result.code === 0 || result.code === null)) return result;
-      return { ...result, success: false, error: result.error || `Docker Compose stop exited with code ${result.code}` };
+      // A NAS-hosted Tiled service is shared infrastructure. Stop means
+      // disconnect this Andon session; it must not stop or alter the remote
+      // Docker Compose service.
+      return {
+        success: true,
+        disconnected: true,
+        status: false,
+        managementType: 'docker_compose',
+        screenState: 'disconnected'
+      };
     }
     if (serverConfig.external_service) {
       return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
@@ -1183,7 +1180,8 @@ class SSHOperations {
       const result = await this.executeDockerComposeCommand(
         serverName,
         `ps --status running --quiet ${shellQuote(management.service)}`,
-        5000
+        5000,
+        { quiet: true }
       );
       if (!result.success) {
         return {
@@ -1220,10 +1218,10 @@ class SSHOperations {
     }
     
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
 
     if (!result.success) {
-      log.warn(`${serverName}: Failed to get status - SSH down`);
+      log.debug(`${serverName}: Failed to get status - SSH down`);
       return { success: false, sshDown: true };
     }
     
@@ -1271,10 +1269,10 @@ class SSHOperations {
     
     log.debug(`Batch status check for host ${host} using ${serverName}`);
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
     
     if (!result.success) {
-      log.warn(`Batch status check failed for host ${host} - SSH down`);
+      log.debug(`Batch status check failed for host ${host} - SSH down`);
       return { success: false, sshDown: true, host };
     }
     

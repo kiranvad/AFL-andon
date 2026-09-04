@@ -1,6 +1,6 @@
 // main.js
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
-const { createLogger, logFilePath } = require('./logger');
+const { createLogger, logFilePath, setLogSink } = require('./logger');
 const { CombinedLogWriter } = require('./combinedLog');
 const log = createLogger('main');
 
@@ -43,6 +43,31 @@ function sendSessionLogEvent(entry, payload) {
     entry.owner.send('server-log-stream', message);
   }
 }
+
+setLogSink(({ level, moduleName, text, observedAt }) => {
+  // Polling details remain available in afl-andon.log at debug level. The
+  // combined log keeps operational messages and explicit status transitions.
+  if (!['error', 'warn', 'info'].includes(level)) return;
+  const lines = String(text).split(/\r?\n/);
+  const entries = lines.map(line => ({
+    server: 'Andon',
+    text: `[${level.toUpperCase()}] [${moduleName}] ${line}`,
+    observedAt,
+    type: 'app'
+  }));
+  combinedLogWriter.append(entries).catch(error => {
+    console.error(`Could not write Andon application log to ${combinedLogWriter.filePath}: ${error.message}`);
+  });
+  sendSessionLogEvent(
+    { serverName: 'Andon', owner: mainWindow?.webContents },
+    {
+      type: 'data',
+      data: `${entries.map(entry => entry.text).join('\n')}\n`,
+      observedAt,
+      persisted: true
+    }
+  );
+});
 
 function scheduleSessionLogReconnect(entry) {
   if (!entry.desired || entry.reconnectTimer) return;
@@ -727,8 +752,11 @@ ipcMain.handle('stop-server', async (event, serverName) => {
     if (result.success) {
       andonManagedServers.delete(serverName);
       stopSessionLogStream(serverName);
+      await closeSSHConnection(serverName);
+      log.info(`stop-server: ${serverName} stopped or disconnected successfully`);
+    } else {
+      log.error(`stop-server: ${serverName} failed to stop or disconnect: ${result.error || 'Unknown error'}`);
     }
-    log.info(`stop-server: ${serverName} stopped successfully`);
     return result;
   } catch (error) {
     log.error(`stop-server: Error for ${serverName}:`, error.message);

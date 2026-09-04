@@ -57,7 +57,7 @@ test('server colors are stable and distinguish common names', () => {
   assert.notEqual(stableServerColor('alpha'), stableServerColor('beta'));
 });
 
-test('suppresses only successful Tiled access logs for its configured health path', () => {
+test('suppresses successful access logs for configured server health paths', () => {
   const tiled = { server_type: 'tiled', status_url: 'http://tiled-host:8000/healthz' };
   assert.equal(
     isRoutineHealthLog('catalog', tiled, 'INFO: 127.0.0.1:50000 - "GET /healthz HTTP/1.1" 200 OK'),
@@ -77,6 +77,30 @@ test('suppresses only successful Tiled access logs for its configured health pat
   );
   assert.equal(
     isRoutineHealthLog('catalog', { ...tiled, server_type: 'other' }, '"GET /healthz HTTP/1.1" 200 OK'),
-    false
+    true
+  );
+  assert.equal(
+    isRoutineHealthLog('camera', {}, 'INFO: 127.0.0.1:50000 - "GET /queue_state HTTP/1.1" 200 OK'),
+    true
+  );
+  assert.equal(
+    isRoutineHealthLog('tiled', { server_type: 'tiled' }, 'INFO: 127.0.0.1:50000 - "GET /api/v1/metadata/ HTTP/1.1" 200 OK'),
+    true
+  );
+  assert.equal(
+    isRoutineHealthLog(
+      'tiled',
+      { server_type: 'tiled' },
+      'afl-tiled-tiled-1 | [request-id] 127.0.0.1:44884 (anon) - "GET /api/v1/metadata HTTP/1.1" 307 Temporary Redirect'
+    ),
+    true
+  );
+  assert.equal(
+    isRoutineHealthLog(
+      'tiled',
+      { server_type: 'tiled', status_url: 'http://localhost:8000/healthz' },
+      'example-tiled-1 | [request-id] 192.0.2.20:48298 (singleuser) - "GET /api/v1/metadata/ HTTP/1.1" 200 OK'
+    ),
+    true
   );
 });

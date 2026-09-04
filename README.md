@@ -19,21 +19,26 @@ running session for interactive commands.
 
 ## Server Controls
 
-Each server card starts with red **SCREEN DOWN** and **SERVER DOWN** indicators.
+Each server card starts with red **SSH DOWN** and **SERVER DOWN** indicators.
 
 - **Start** launches the server over SSH, resets both indicators to red, and
-  then performs a status check. A live screen becomes green **SCREEN ACTIVE**;
-  a responding HTTP endpoint becomes green **SERVER UP**, **SERVER READY**, or
-  **SERVER BUSY**, depending on its queue-state response.
-- **Stop** sends the stop command and immediately leaves both indicators red.
+  then performs a status check. A working SSH connection becomes green **SSH UP**.
+  A responding server is green **SERVER ACTIVE**, a paused server is yellow
+  **SERVER PAUSED**, and an unreachable server is red **SERVER DOWN**.
+- **Stop** sends the stop command for a local launcher. For NAS-managed Tiled,
+  it disconnects Andon without changing the remote container and displays
+  **SSH DOWN** and **SERVER DOWN**.
 - **Restart** resets the indicators to red while it stops and starts the
   server, then performs the same status check as **Start**.
 
 After a successful **Start** or **Restart**, Andon polls only that server for
 screen and queue state every 500 ms. Launchers not started by the current
-Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
-unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
-errors are written to the application terminal log rather than the card.
+Andon session are not polled, including active external or NAS profiles loaded
+from configuration. A failed SSH check displays **SSH DOWN**; an
+unreachable HTTP endpoint displays **SERVER DOWN**. Server cards and sidebar
+buttons use green for active, yellow for paused, and red for down. Detailed
+HTTP connection errors are written to the application terminal log rather than
+the card.
 
 The **All Logs** sidebar view records each screen log's byte boundary just
 before Start or Restart, then opens a continuous SSH follow stream as soon as
@@ -41,16 +46,20 @@ the Screen session exists. It captures startup and later output without polling
 a fixed-size tail or loading older history. Streams continue while the view is
 hidden and close after a successful Stop.
 
-The displayed combined entries are also saved for the full Andon session in
+The combined view includes both server output and Andon's own application log
+messages. These entries are also saved for the full Andon session in
 `~/.afl/logs/combined/`. Each launch creates a separate file whose name
 contains Andon's startup timestamp, such as
 `andon-2026-08-25_14-03-07-042.log`. Clearing the sidebar does not remove
-entries from that file.
+entries from that file. Polled server state is recorded only when it changes;
+repetitive successful health-request access lines are omitted, and routine
+polling diagnostics remain in `~/.afl/logs/afl-andon.log` at debug level.
 
 When the window is closed from the GUI, Andon asks for confirmation before it
 sends the normal stop command to every launcher started or restarted during
-that Andon session. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers
-that were already running when Andon opened are not stopped.
+that Andon session. NAS-managed Tiled containers are disconnected instead of
+stopped. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers that were
+already running when Andon opened are not stopped.
 
 ## Prerequisites
 
@@ -239,10 +248,12 @@ still determines whether lifecycle management uses Screen or Docker Compose.
 
 Because this YAML contains a credential, keep it out of Git and make it
 readable only by the account running Andon (for example, mode `0600`). The
-`management` block makes the standard controls operate on the named Docker
-Compose service over SSH: Start, Stop, Restart, View Log, and Join respectively
-run the Compose lifecycle commands, read service logs, and open `join_shell`
-inside the container. The SSH account must accept the selected authentication
+`management` block makes Start and Restart operate on the named Docker Compose
+service over SSH, while View Log reads service logs and Join opens `join_shell`
+inside the container. Stop only disconnects Andon's status polling, embedded
+browser, log stream, and interactive SSH session; it does not stop or alter the
+NAS container. The
+SSH account must accept the selected authentication
 method and have permission to run `sudo`. Docker Compose is never invoked as
 the login user: Andon opens a root login shell with `sudo -i` and supplies the
 same in-memory password over SSH standard input.
