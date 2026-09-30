@@ -54,19 +54,20 @@ function escapeRegExp(value) {
 function isRoutineHealthLog(serverName, serverConfig, line) {
   const isTiled = serverConfig?.server_type === 'tiled' ||
     String(serverName || '').trim().toLocaleLowerCase() === 'tiled';
-  if (!isTiled) return false;
 
-  let healthPath = '/queue_state';
+  const healthPaths = new Set([isTiled ? '/api/v1/metadata/' : '/queue_state']);
   if (serverConfig?.status_url) {
     try {
-      healthPath = new URL(serverConfig.status_url).pathname || '/';
+      healthPaths.add(new URL(serverConfig.status_url).pathname || '/');
     } catch (_) {
-      return false;
+      // Keep filtering the built-in status path when a custom URL is invalid.
     }
   }
-  const pathPattern = escapeRegExp(healthPath.replace(/\/$/, '') || '/');
-  return new RegExp(`(?:"|\\s)GET\\s+${pathPattern}(?:\\?[^\\s"]*)?\\s+HTTP\\/\\d(?:\\.\\d)?"?\\s+2\\d\\d(?:\\s|$)`, 'i')
-    .test(String(line));
+  return [...healthPaths].some(healthPath => {
+    const pathPattern = escapeRegExp(healthPath.replace(/\/+$/, ''));
+    return new RegExp(`(?:"|\\s)GET\\s+${pathPattern}\/?(?:\\?[^\\s"]*)?\\s+HTTP\\/\\d(?:\\.\\d)?"?\\s+[23]\\d\\d(?:\\s|$)`, 'i')
+      .test(String(line));
+  });
 }
 
 module.exports = {

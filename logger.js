@@ -31,6 +31,38 @@ const LEVEL_NAMES = {
 };
 
 const currentLevel = LOG_LEVELS[logLevel] ?? LOG_LEVELS.debug;
+let logSink = null;
+
+function stringifyArgs(args) {
+  return args.map(item => {
+    if (item === null) return 'null';
+    if (item === undefined) return 'undefined';
+    if (item instanceof Error) {
+      return item.stack || item.message || String(item);
+    }
+    if (typeof item === 'object') {
+      try {
+        return JSON.stringify(item, null, 2);
+      } catch {
+        return String(item);
+      }
+    }
+    return String(item);
+  }).join(' ');
+}
+
+function emitLogEntry(level, moduleName, args) {
+  if (!logSink) return;
+  try {
+    logSink({ level, moduleName, text: stringifyArgs(args), observedAt: Date.now() });
+  } catch (_) {
+    // Logging must never interrupt application behavior.
+  }
+}
+
+function setLogSink(sink) {
+  logSink = typeof sink === 'function' ? sink : null;
+}
 
 // Create Python-style format: "2025-12-02 10:30:45,123 - module - LEVEL - message"
 function formatDate() {
@@ -51,21 +83,7 @@ function formatMessage(level, moduleName, args) {
   const levelName = (LEVEL_NAMES[level] || level.toUpperCase()).padEnd(7);
   const modName = moduleName.padEnd(15);
   
-  const text = args.map(item => {
-    if (item === null) return 'null';
-    if (item === undefined) return 'undefined';
-    if (item instanceof Error) {
-      return item.stack || item.message || String(item);
-    }
-    if (typeof item === 'object') {
-      try {
-        return JSON.stringify(item, null, 2);
-      } catch {
-        return String(item);
-      }
-    }
-    return String(item);
-  }).join(' ');
+  const text = stringifyArgs(args);
   
   return `[${timestamp}] [${levelName.toLowerCase().trim()}] [${moduleName}] ${text}`;
 }
@@ -75,6 +93,7 @@ function createSimpleLogger(moduleName) {
   const logFn = (level, ...args) => {
     if (LOG_LEVELS[level] > currentLevel) return;
     const message = formatMessage(level, moduleName, args);
+    emitLogEntry(level, moduleName, args);
     
     if (level === 'error') {
       console.error(message);
@@ -126,13 +145,17 @@ function createLogger(moduleName) {
   if (isMain && log.info) {
     // Main process with electron-log
     const prefix = `[${moduleName}]`;
+    const logFn = (level, ...args) => {
+      log[level](prefix, ...args);
+      if (LOG_LEVELS[level] <= currentLevel) emitLogEntry(level, moduleName, args);
+    };
     return {
-      error: (...args) => log.error(prefix, ...args),
-      warn: (...args) => log.warn(prefix, ...args),
-      info: (...args) => log.info(prefix, ...args),
-      debug: (...args) => log.debug(prefix, ...args),
-      verbose: (...args) => log.verbose(prefix, ...args),
-      silly: (...args) => log.silly(prefix, ...args),
+      error: (...args) => logFn('error', ...args),
+      warn: (...args) => logFn('warn', ...args),
+      info: (...args) => logFn('info', ...args),
+      debug: (...args) => logFn('debug', ...args),
+      verbose: (...args) => logFn('verbose', ...args),
+      silly: (...args) => logFn('silly', ...args),
     };
   } else {
     // Renderer process - use simple logger
@@ -151,3 +174,4 @@ if (isMain) {
 module.exports = log;
 module.exports.createLogger = createLogger;
 module.exports.logFilePath = logFilePath;
+module.exports.setLogSink = setLogSink;

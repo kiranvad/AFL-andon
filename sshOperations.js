@@ -3,9 +3,15 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const { createLogger } = require('./logger');
+const { loadTiledProfile } = require('./tiled/profile');
+const { updateAflTiledConfig } = require('./aflGlobalConfig');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
+const SUDO_PROMPT = '__AFL_ANDON_SUDO_PASSWORD__';
+const COMPOSE_ALREADY_RUNNING = '__AFL_ANDON_ALREADY_RUNNING__';
+const COMPOSE_PROJECT_MISSING = '__AFL_ANDON_PROJECT_MISSING__';
+const COMPOSE_SERVICE_MISSING = '__AFL_ANDON_SERVICE_MISSING__';
 
 // Common SSH key filenames in order of preference (modern/secure first)
 // Based on OpenSSH default identity file search order
@@ -50,12 +56,17 @@ function parseScreenSessions(output) {
 }
 
 class SSHOperations {
-  constructor(configPath, sshKeyPath) {
+  constructor(configPath, sshKeyPath, options = {}) {
     this.config = {};
     this.sshKeyPath = sshKeyPath;
     this.sshKey = null;
     this.sshKeys = [];
     this.preferredSSHKeyPaths = {};
+    // Passwords are intentionally process-local and are never serialized.
+    this.sessionPasswords = new Map();
+    this.createSSHClient = options.clientFactory || (() => new Client());
+    const aflHome = process.env.AFL_HOME?.trim() || path.join(os.homedir(), '.afl');
+    this.aflGlobalConfigPath = options.aflGlobalConfigPath || path.join(aflHome, 'config.json');
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
@@ -99,6 +110,30 @@ class SSHOperations {
           server.username = os.userInfo().username;
         }
       });
+
+      for (const [serverName, server] of Object.entries(this.config)) {
+        if (server.server_type !== 'tiled' || !server.config_file_location) continue;
+        try {
+          const profile = await loadTiledProfile(server.config_file_location, { loadApiKey: false });
+          server.external_service = profile.mode === 'external';
+          server.tiled_management = profile.management;
+          if (server.external_service) {
+            server.tiled_profile_uri = profile.uri;
+            server.tiled_catalog_path = profile.catalogPath || server.tiled_catalog_path;
+            if (profile.management.type === 'docker_compose') {
+              server.host = profile.management.host;
+              server.username = profile.management.username;
+              const endpoint = new URL(profile.uri);
+              server.httpPort = Number(endpoint.port) || (endpoint.protocol === 'https:' ? 443 : 80);
+            }
+            log.info(`${serverName}: Loaded ${profile.management.type} Tiled profile ${server.config_file_location}`);
+          } else {
+            delete server.tiled_profile_uri;
+          }
+        } catch (error) {
+          log.warn(`${serverName}: Could not inspect Tiled profile: ${error.message}`);
+        }
+      }
     } catch (error) {
       log.error(`Failed to load config from ${this.configPath}:`, error.message);
       if (error.code === 'ENOENT') {
@@ -211,9 +246,79 @@ class SSHOperations {
       /authentication methods failed|all configured authentication methods failed|permission denied/i.test(error.message || '');
   }
 
+  getCredentialId(serverName) {
+    const server = this.config[serverName];
+    return server ? `${server.username}@${server.host}` : '';
+  }
+
+  setSessionPassword(serverName, password) {
+    const credentialId = this.getCredentialId(serverName);
+    if (!credentialId) throw new Error(`Server not found: ${serverName}`);
+    if (typeof password !== 'string' || !password) throw new Error('SSH password is required.');
+    this.sessionPasswords.set(credentialId, password);
+  }
+
+  hasSessionPassword(serverName) {
+    const credentialId = this.getCredentialId(serverName);
+    return Boolean(credentialId && this.sessionPasswords.get(credentialId));
+  }
+
+  getSessionPassword(serverName) {
+    return this.sessionPasswords.get(this.getCredentialId(serverName)) || '';
+  }
+
+  clearSessionPassword(serverName) {
+    const credentialId = this.getCredentialId(serverName);
+    if (credentialId) this.sessionPasswords.delete(credentialId);
+  }
+
+  connectWithPassword(serverName, serverConfig, password, timeout = 0, extraOptions = {}) {
+    return new Promise((resolve, reject) => {
+      const conn = this.createSSHClient();
+      let timer;
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        fn(value);
+      };
+
+      conn
+        .on('ready', () => finish(resolve, conn))
+        .on('keyboard-interactive', (_name, _instructions, _language, prompts, reply) => {
+          // Synology DSM commonly exposes password login through SSH's
+          // keyboard-interactive method. OpenSSH handles this automatically,
+          // while ssh2 requires the client to answer the prompts explicitly.
+          log.debug(`${serverName}: Answering ${prompts.length} keyboard-interactive SSH prompt(s)`);
+          reply(prompts.map(() => password));
+        })
+        .on('error', error => {
+          try { conn.end(); } catch (_) { /* Connection already closed. */ }
+          finish(reject, error);
+        });
+      conn.connect({
+        host: serverConfig.host,
+        port: serverConfig.sshPort || 22,
+        username: serverConfig.username,
+        password,
+        tryKeyboard: true,
+        ...extraOptions
+      });
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          const error = new Error(`SSH connection timed out after ${timeout}ms`);
+          error.code = 'ETIMEDOUT';
+          conn.destroy();
+          finish(reject, error);
+        }, timeout);
+      }
+    });
+  }
+
   connectWithKey(serverName, serverConfig, authKey, timeout = 0, extraOptions = {}) {
     return new Promise((resolve, reject) => {
-      const conn = new Client();
+      const conn = this.createSSHClient();
       let timer;
       let settled = false;
       const cleanup = () => {
@@ -247,7 +352,7 @@ class SSHOperations {
       log.debug(`${serverName}: Trying SSH key ${authKey.path}`);
       conn.connect({
         host: serverConfig.host,
-        port: 22,
+        port: serverConfig.sshPort || 22,
         username: serverConfig.username,
         privateKey: authKey.key,
         ...extraOptions
@@ -271,10 +376,29 @@ class SSHOperations {
       throw new Error(`Server not found: ${serverName}`);
     }
 
-    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
-    if (authKeys.length === 0) {
-      throw new Error('No SSH key loaded');
+    const credentialId = this.getCredentialId(serverName);
+    const password = this.sessionPasswords.get(credentialId);
+    if (password) {
+      try {
+        const conn = await this.connectWithPassword(serverName, serverConfig, password, timeout, extraOptions);
+        return { conn, authentication: 'password' };
+      } catch (error) {
+        if (!this.isAuthenticationError(error)) throw error;
+        this.sessionPasswords.delete(credentialId);
+        const authenticationError = new Error(`SSH password authentication failed for ${credentialId}.`);
+        authenticationError.code = 'SSH_AUTHENTICATION_REQUIRED';
+        throw authenticationError;
+      }
     }
+
+    if (serverConfig.tiled_management?.authentication === 'password') {
+      const authenticationError = new Error(`SSH password required for ${credentialId}.`);
+      authenticationError.code = 'SSH_AUTHENTICATION_REQUIRED';
+      throw authenticationError;
+    }
+
+    const authKeys = this.getAvailableSSHKeys(serverConfig.host);
+    if (authKeys.length === 0) throw new Error('No SSH key or session password is available');
 
     let lastError = null;
     for (const authKey of authKeys) {
@@ -331,16 +455,22 @@ class SSHOperations {
     }
   }
 
-  async executeCommand(serverName, command, timeout = 0) {
+  async executeCommand(serverName, command, timeout = 0, options = {}) {
     const serverConfig = this.config[serverName];
     if (!serverConfig) {
       log.error(`No config found for server: ${serverName}`);
       return { success: false, sshDown: true };
     }
 
-    if (this.getAvailableSSHKeys().length === 0) {
-      log.error(`No SSH key loaded - cannot execute command for ${serverName}`);
-      return { success: false, sshDown: true, error: 'No SSH key loaded' };
+    if (this.getAvailableSSHKeys().length === 0 && !this.hasSessionPassword(serverName)) {
+      const passwordRequired = serverConfig.tiled_management?.authentication === 'password';
+      if (!options.quiet) log.error(`No SSH credential available for ${serverName}`);
+      return {
+        success: false,
+        sshDown: !passwordRequired,
+        authenticationRequired: passwordRequired,
+        error: passwordRequired ? 'SSH password required' : 'No SSH credential available'
+      };
     }
 
     log.debug(`${serverName} -> ${serverConfig.host}: Executing command: ${command}`);
@@ -349,21 +479,28 @@ class SSHOperations {
     try {
       ({ conn } = await this.connectWithAvailableKeys(serverName, timeout));
     } catch (error) {
-      log.error(`${serverName}: SSH connection error:`, error.message);
+      if (!options.quiet) log.error(`${serverName}: SSH connection error:`, error.message);
       if (error.level) {
         log.debug(`${serverName}: Error level: ${error.level}`);
       }
-      return { success: false, sshDown: true, error: error.message };
+      return {
+        success: false,
+        sshDown: error.code !== 'SSH_AUTHENTICATION_REQUIRED',
+        authenticationRequired: error.code === 'SSH_AUTHENTICATION_REQUIRED',
+        error: error.message
+      };
     }
 
     return new Promise((resolve) => {
-      conn.exec(command, (err, stream) => {
+      const onExec = (err, stream) => {
         if (err) {
-          log.error(`${serverName}: Command execution failed:`, err.message);
+          if (!options.quiet) log.error(`${serverName}: Command execution failed:`, err.message);
           conn.end();
           resolve({ success: false, sshDown: true, error: err.message });
           return;
         }
+
+        if (options.stdin) stream.end(options.stdin);
 
         let output = '';
         stream.on('close', (code, signal) => {
@@ -371,7 +508,7 @@ class SSHOperations {
           log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
           // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
           const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
-          if (code !== 0 && code !== null && !isScreenLsNoScreens) {
+          if (code !== 0 && code !== null && !isScreenLsNoScreens && !options.quiet) {
             log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
           resolve({ success: true, output, code, signal });
@@ -382,7 +519,9 @@ class SSHOperations {
           output += data;
           log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
         });
-      });
+      };
+      if (options.pty) conn.exec(command, { pty: true }, onExec);
+      else conn.exec(command, onExec);
     });
   }
 
@@ -438,6 +577,33 @@ class SSHOperations {
   }
 
   async probeServerHealth(serverName) {
+    const serverConfig = this.config[serverName];
+    if (serverConfig?.server_type === 'tiled') {
+      let timer;
+      try {
+        const profile = await loadTiledProfile(serverConfig.config_file_location);
+        const baseUrl = profile.uri || serverConfig.webview_url ||
+          `http://${serverConfig.host}:${serverConfig.httpPort}/`;
+        const url = new URL('api/v1/metadata/', baseUrl).toString();
+        const controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), 3000);
+        const response = await fetch(url, {
+          headers: {
+            Accept: 'application/vnd.api+json, application/json',
+            ...(profile.apiKey ? { Authorization: `Apikey ${profile.apiKey}` } : {})
+          },
+          signal: controller.signal
+        });
+        return response.ok
+          ? { ok: true, url, statusCode: response.status }
+          : { ok: false, url, statusCode: response.status, reason: `HTTP ${response.status}` };
+      } catch (error) {
+        return { ok: false, url: serverConfig.tiled_profile_uri || serverConfig.webview_url, reason: error.message };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     const url = this.getStatusUrl(serverName);
     const command = `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(url)}`;
     const result = await this.executeCommand(serverName, command, 5000);
@@ -464,6 +630,22 @@ class SSHOperations {
       if (attempt < attempts - 1) await sleep(intervalMs);
     }
     return lastResult;
+  }
+
+  async activateTiledForSession(serverName) {
+    const serverConfig = this.config[serverName];
+    if (serverConfig?.server_type !== 'tiled') return null;
+
+    const profile = await loadTiledProfile(serverConfig.config_file_location);
+    const tiledServer = profile.uri || serverConfig.webview_url ||
+      `http://${serverConfig.host}:${serverConfig.httpPort || 8000}/`;
+    const result = await updateAflTiledConfig(
+      this.aflGlobalConfigPath,
+      tiledServer,
+      profile.apiKey
+    );
+    log.info(`${serverName}: Activated ${result.record.tiled_server} in AFL global config ${this.aflGlobalConfigPath}`);
+    return result;
   }
 
   async ensureScreenDetached(serverName) {
@@ -546,6 +728,69 @@ class SSHOperations {
     return { success: true, configPath: remotePath };
   }
 
+  isDockerComposeManaged(serverConfig) {
+    return serverConfig?.server_type === 'tiled' &&
+      serverConfig?.tiled_management?.type === 'docker_compose';
+  }
+
+  getDockerComposeCommand(serverConfig, args) {
+    const management = serverConfig.tiled_management;
+    return `cd ${shellQuote(management.projectDirectory)} && docker compose ${args}`;
+  }
+
+  getSudoDockerComposeCommand(serverConfig, args, prompt = '') {
+    const command = this.getDockerComposeCommand(serverConfig, args);
+    return `sudo -S -p ${shellQuote(prompt)} -i sh -lc ${shellQuote(command)}`;
+  }
+
+  getSudoPrompt() {
+    return SUDO_PROMPT;
+  }
+
+  executeDockerComposeCommand(serverName, args, timeout = 0, options = {}) {
+    const serverConfig = this.config[serverName];
+    const password = this.getSessionPassword(serverName);
+    if (!password) {
+      return Promise.resolve({
+        success: false,
+        authenticationRequired: true,
+        error: 'A password is required for sudo on the NAS.'
+      });
+    }
+    return this.executeCommand(
+      serverName,
+      this.getSudoDockerComposeCommand(serverConfig, args),
+      timeout,
+      { ...options, stdin: `${password}\n` }
+    );
+  }
+
+  getDockerComposeStartCommand(serverConfig) {
+    const management = serverConfig.tiled_management;
+    const directory = shellQuote(management.projectDirectory);
+    const service = shellQuote(management.service);
+    return [
+      `if ! test -d ${directory}; then printf '%s\\n' '${COMPOSE_PROJECT_MISSING}'; exit 40; fi`,
+      `cd ${directory} || exit 40`,
+      `if ! docker compose config --services | grep -Fx -- ${service} >/dev/null; then printf '%s\\n' '${COMPOSE_SERVICE_MISSING}'; exit 41; fi`,
+      `if [ -n "$(docker compose ps --status running --quiet ${service})" ]; then printf '%s\\n' '${COMPOSE_ALREADY_RUNNING}'; else docker compose up -d ${service}; fi`
+    ].join('; ');
+  }
+
+  getJoinCommand(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    if (this.isDockerComposeManaged(serverConfig)) {
+      const management = serverConfig.tiled_management;
+      return this.getSudoDockerComposeCommand(
+        serverConfig,
+        `exec ${shellQuote(management.service)} ${shellQuote(management.joinShell)}`,
+        SUDO_PROMPT
+      );
+    }
+    return `screen -x ${shellQuote(serverConfig.screen_name)}`;
+  }
+
   async startServer(serverName, options = {}) {
     log.info(`Starting server: ${serverName}`);
     const serverConfig = this.config[serverName];
@@ -553,6 +798,52 @@ class SSHOperations {
     if (!serverConfig) {
       log.error(`Cannot start server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      let launchContext;
+      if (typeof options.onBeforeLaunch === 'function') launchContext = await options.onBeforeLaunch();
+      const password = this.getSessionPassword(serverName);
+      if (!password) {
+        return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+      }
+      const result = await this.executeCommand(
+        serverName,
+        `sudo -S -p '' -i sh -lc ${shellQuote(this.getDockerComposeStartCommand(serverConfig))}`,
+        0,
+        { stdin: `${password}\n` }
+      );
+      if (!result.success || (result.code !== 0 && result.code !== null)) {
+        let error = result.error || `Docker Compose validation/start exited with code ${result.code}`;
+        if (String(result.output || '').includes(COMPOSE_PROJECT_MISSING)) {
+          error = `Docker Compose project directory does not exist: ${serverConfig.tiled_management.projectDirectory}`;
+        } else if (String(result.output || '').includes(COMPOSE_SERVICE_MISSING)) {
+          error = `Docker Compose service "${serverConfig.tiled_management.service}" is not declared in ${serverConfig.tiled_management.projectDirectory}`;
+        }
+        return { ...result, success: false, error };
+      }
+      if (typeof options.onLaunched === 'function') await options.onLaunched(launchContext);
+      const health = await this.waitForServerHealth(
+        serverName,
+        serverConfig.health_check_attempts || 20,
+        serverConfig.health_check_interval_ms || 1000
+      );
+      if (!health.ok) {
+        const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
+        return { success: false, error: `Container started but Tiled is not reachable at ${health.url}: ${reason}`, health };
+      }
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled is running, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
+      return {
+        ...result,
+        alreadyRunning: String(result.output || '').includes(COMPOSE_ALREADY_RUNNING),
+        health
+      };
+    }
+    if (serverConfig.external_service) {
+      return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
     }
 
     let launchConfigPath = null;
@@ -696,9 +987,38 @@ class SSHOperations {
     );
     if (!health.ok) {
       const reason = health.statusCode ? `HTTP ${health.statusCode}` : health.reason;
-      const error = `Server started but is not reachable at ${health.url}: ${reason}`;
-      log.error(`${serverName}: ${error}`);
-      return { success: false, error, health };
+      const warning = `Server process started but HTTP is not reachable at ${health.url}: ${reason}`;
+      const detached = await this.ensureScreenDetached(serverName);
+      if (!detached.ok) {
+        const error = `${warning}; screen session is unavailable: ${detached.reason}`;
+        log.error(`${serverName}: ${error}`);
+        return { success: false, error, health };
+      }
+
+      // Some AFL drivers intentionally continue without a Tiled backend after
+      // their own connection retries. A live Screen session is therefore a
+      // successful (but degraded) launch even if HTTP is not ready yet.
+      const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'running');
+      const runtimeWarning = runtimeConfig.success
+        ? warning
+        : `${warning}; Andon runtime config was not updated: ${runtimeConfig.error || 'unknown error'}`;
+      log.warn(`${serverName}: ${runtimeWarning}`);
+      return {
+        ...result,
+        success: true,
+        degraded: true,
+        warning: runtimeWarning,
+        health,
+        screenState: 'detached'
+      };
+    }
+
+    if (serverConfig.server_type === 'tiled') {
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled is running, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
     }
 
     const detached = await this.ensureScreenDetached(serverName);
@@ -726,6 +1046,21 @@ class SSHOperations {
     if (!serverConfig) {
       log.error(`Cannot stop server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      // A NAS-hosted Tiled service is shared infrastructure. Stop means
+      // disconnect this Andon session; it must not stop or alter the remote
+      // Docker Compose service.
+      return {
+        success: true,
+        disconnected: true,
+        status: false,
+        managementType: 'docker_compose',
+        screenState: 'disconnected'
+      };
+    }
+    if (serverConfig.external_service) {
+      return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
     }
     
     // Build a more robust stop command that:
@@ -783,6 +1118,31 @@ class SSHOperations {
 
   async restartServer(serverName, options = {}) {
     log.info(`Restarting server: ${serverName}`);
+    const serverConfig = this.config[serverName];
+    if (this.isDockerComposeManaged(serverConfig)) {
+      let launchContext;
+      if (typeof options.onBeforeLaunch === 'function') launchContext = await options.onBeforeLaunch();
+      const management = serverConfig.tiled_management;
+      const result = await this.executeDockerComposeCommand(serverName, `restart ${shellQuote(management.service)}`);
+      if (!result.success || (result.code !== 0 && result.code !== null)) {
+        return { ...result, success: false, error: result.error || `Docker Compose restart exited with code ${result.code}` };
+      }
+      if (typeof options.onLaunched === 'function') await options.onLaunched(launchContext);
+      const health = await this.waitForServerHealth(
+        serverName,
+        serverConfig.health_check_attempts || 20,
+        serverConfig.health_check_interval_ms || 1000
+      );
+      if (!health.ok) {
+        return { success: false, error: `Container restarted but Tiled is not reachable at ${health.url}: ${health.reason || `HTTP ${health.statusCode}`}`, health };
+      }
+      try {
+        await this.activateTiledForSession(serverName);
+      } catch (error) {
+        return { success: false, error: `Tiled restarted, but AFL global configuration could not be updated: ${error.message}`, health };
+      }
+      return { ...result, health };
+    }
     const stopResult = await this.stopServer(serverName);
     if (!stopResult.success && !stopResult.sshDown) {
       log.error(`${serverName}: Stop failed during restart`);
@@ -806,6 +1166,38 @@ class SSHOperations {
       log.error(`Cannot get status: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
     }
+    if (this.isDockerComposeManaged(serverConfig)) {
+      if (serverConfig.tiled_management.authentication === 'password' && !this.hasSessionPassword(serverName)) {
+        return {
+          success: false,
+          status: false,
+          authenticationRequired: true,
+          managementType: 'docker_compose',
+          screenState: 'unknown'
+        };
+      }
+      const management = serverConfig.tiled_management;
+      const result = await this.executeDockerComposeCommand(
+        serverName,
+        `ps --status running --quiet ${shellQuote(management.service)}`,
+        5000,
+        { quiet: true }
+      );
+      if (!result.success) {
+        return {
+          success: false,
+          sshDown: !!result.sshDown,
+          authenticationRequired: !!result.authenticationRequired,
+          managementType: 'docker_compose',
+          error: result.error
+        };
+      }
+      const running = (result.code === 0 || result.code === null) && Boolean(String(result.output || '').trim());
+      return { success: true, status: running, managementType: 'docker_compose', screenState: running ? 'running' : 'missing' };
+    }
+    if (serverConfig.external_service) {
+      return { success: true, status: true, external: true, screenState: 'external' };
+    }
 
     log.debug(`${serverName}: Checking status on ${serverConfig.host}`);
     
@@ -826,10 +1218,10 @@ class SSHOperations {
     }
     
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
 
     if (!result.success) {
-      log.warn(`${serverName}: Failed to get status - SSH down`);
+      log.debug(`${serverName}: Failed to get status - SSH down`);
       return { success: false, sshDown: true };
     }
     
@@ -877,10 +1269,10 @@ class SSHOperations {
     
     log.debug(`Batch status check for host ${host} using ${serverName}`);
     const statusCommand = 'screen -ls';
-    const result = await this.executeCommand(serverName, statusCommand, 500);
+    const result = await this.executeCommand(serverName, statusCommand, 500, { quiet: true });
     
     if (!result.success) {
-      log.warn(`Batch status check failed for host ${host} - SSH down`);
+      log.debug(`Batch status check failed for host ${host} - SSH down`);
       return { success: false, sshDown: true, host };
     }
     
@@ -911,6 +1303,7 @@ class SSHOperations {
     
     Object.entries(this.config).forEach(([serverName, serverConfig]) => {
       if (!serverConfig.active) return;
+      if (serverConfig.external_service) return;
       
       const host = serverConfig.host;
       if (!hostMap[host]) {
@@ -932,12 +1325,25 @@ class SSHOperations {
       log.error(`Cannot get log: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
     }
+    if (this.isDockerComposeManaged(serverConfig) && !this.hasSessionPassword(serverName)) {
+      return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+    }
     
-    const logPath = path.join('.afl', `${serverConfig.screen_name}.screenlog`);
-    const logCommand = `tail -n ${lines} $\{HOME}/${logPath}`;
+    const logCommand = this.isDockerComposeManaged(serverConfig)
+      ? this.getSudoDockerComposeCommand(
+        serverConfig,
+        `logs --tail=${Number.parseInt(lines, 10) || 200} --no-color ${shellQuote(serverConfig.tiled_management.service)}`
+      )
+      : `tail -n ${lines} $\{HOME}/${path.join('.afl', `${serverConfig.screen_name}.screenlog`)}`;
     log.debug(`${serverName}: Log command: ${logCommand}`);
     
-    const result = await this.executeCommand(serverName, logCommand);
+    const password = this.isDockerComposeManaged(serverConfig) ? this.getSessionPassword(serverName) : '';
+    const result = await this.executeCommand(
+      serverName,
+      logCommand,
+      0,
+      password ? { stdin: `${password}\n` } : {}
+    );
     
     if (result.success) {
       log.debug(`${serverName}: Retrieved ${result.output?.length || 0} bytes of log`);
@@ -951,6 +1357,7 @@ class SSHOperations {
   async getServerLogSize(serverName) {
     const serverConfig = this.config[serverName];
     if (!serverConfig) return { success: false, error: `Server not found: ${serverName}` };
+    if (this.isDockerComposeManaged(serverConfig)) return { success: true, size: 0 };
     const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
     const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
     const result = await this.executeCommand(serverName, `wc -c < ${logPath} 2>/dev/null || printf 0`, 10000);
@@ -962,11 +1369,17 @@ class SSHOperations {
   async streamServerLog(serverName, startOffset, handlers = {}) {
     const serverConfig = this.config[serverName];
     if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+    const dockerCompose = this.isDockerComposeManaged(serverConfig);
     const relativeLogPath = `.afl/${serverConfig.screen_name}.screenlog`;
     const logPath = `"$HOME"/${shellQuote(relativeLogPath)}`;
-    const hasOffset = Number.isSafeInteger(startOffset) && startOffset >= 0;
+    const hasOffset = !dockerCompose && Number.isSafeInteger(startOffset) && startOffset >= 0;
     const offset = hasOffset ? startOffset : 0;
-    const command = hasOffset ? `tail -c +${offset + 1} -F ${logPath}` : `tail -n 0 -F ${logPath}`;
+    const command = dockerCompose
+      ? this.getSudoDockerComposeCommand(
+        serverConfig,
+        `logs --follow --tail=0 --no-color ${shellQuote(serverConfig.tiled_management.service)}`
+      )
+      : (hasOffset ? `tail -c +${offset + 1} -F ${logPath}` : `tail -n 0 -F ${logPath}`);
 
     const { conn } = await this.connectWithAvailableKeys(serverName, 10000, {
       keepaliveInterval: 10000,
@@ -1002,6 +1415,15 @@ class SSHOperations {
           return;
         }
         channel = stream;
+        if (dockerCompose) {
+          const password = this.getSessionPassword(serverName);
+          if (!password) {
+            conn.end();
+            reject(new Error('A password is required for sudo on the NAS.'));
+            return;
+          }
+          stream.write(`${password}\n`);
+        }
         stream.setEncoding('utf8');
         stream.on('data', data => {
           if (controller.offset !== null) controller.offset += Buffer.byteLength(data, 'utf8');
@@ -1034,9 +1456,18 @@ class SSHOperations {
       return { success: false, error: 'Server not found' };
     }
     
-    const joinCommand = `screen -x ${serverConfig.screen_name}`;
+    if (this.isDockerComposeManaged(serverConfig) && !this.hasSessionPassword(serverName)) {
+      return { success: false, authenticationRequired: true, error: 'A password is required for sudo on the NAS.' };
+    }
+    const joinCommand = this.getJoinCommand(serverName);
     log.debug(`${serverName}: Join command: ${joinCommand}`);
-    return this.executeCommand(serverName, joinCommand);
+    const password = this.isDockerComposeManaged(serverConfig) ? this.getSessionPassword(serverName) : '';
+    return this.executeCommand(
+      serverName,
+      joinCommand,
+      0,
+      password ? { stdin: `${password}\n`, pty: true } : {}
+    );
   }
 
   getServerForHost(host) {

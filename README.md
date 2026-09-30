@@ -19,21 +19,26 @@ running session for interactive commands.
 
 ## Server Controls
 
-Each server card starts with red **SCREEN DOWN** and **SERVER DOWN** indicators.
+Each server card starts with red **SSH DOWN** and **SERVER DOWN** indicators.
 
 - **Start** launches the server over SSH, resets both indicators to red, and
-  then performs a status check. A live screen becomes green **SCREEN ACTIVE**;
-  a responding HTTP endpoint becomes green **SERVER UP**, **SERVER READY**, or
-  **SERVER BUSY**, depending on its queue-state response.
-- **Stop** sends the stop command and immediately leaves both indicators red.
+  then performs a status check. A working SSH connection becomes green **SSH UP**.
+  A responding server is green **SERVER ACTIVE**, a paused server is yellow
+  **SERVER PAUSED**, and an unreachable server is red **SERVER DOWN**.
+- **Stop** sends the stop command for a local launcher. For NAS-managed Tiled,
+  it disconnects Andon without changing the remote container and displays
+  **SSH DOWN** and **SERVER DOWN**.
 - **Restart** resets the indicators to red while it stops and starts the
   server, then performs the same status check as **Start**.
 
 After a successful **Start** or **Restart**, Andon polls only that server for
 screen and queue state every 500 ms. Launchers not started by the current
-Andon session are not polled. A failed SSH check displays **SSH DOWN**; an
-unreachable HTTP endpoint displays **UNREACHABLE**. Detailed HTTP connection
-errors are written to the application terminal log rather than the card.
+Andon session are not polled, including active external or NAS profiles loaded
+from configuration. A failed SSH check displays **SSH DOWN**; an
+unreachable HTTP endpoint displays **SERVER DOWN**. Server cards and sidebar
+buttons use green for active, yellow for paused, and red for down. Detailed
+HTTP connection errors are written to the application terminal log rather than
+the card.
 
 The **All Logs** sidebar view records each screen log's byte boundary just
 before Start or Restart, then opens a continuous SSH follow stream as soon as
@@ -41,16 +46,20 @@ the Screen session exists. It captures startup and later output without polling
 a fixed-size tail or loading older history. Streams continue while the view is
 hidden and close after a successful Stop.
 
-The displayed combined entries are also saved for the full Andon session in
+The combined view includes both server output and Andon's own application log
+messages. These entries are also saved for the full Andon session in
 `~/.afl/logs/combined/`. Each launch creates a separate file whose name
 contains Andon's startup timestamp, such as
 `andon-2026-08-25_14-03-07-042.log`. Clearing the sidebar does not remove
-entries from that file.
+entries from that file. Polled server state is recorded only when it changes;
+repetitive successful health-request access lines are omitted, and routine
+polling diagnostics remain in `~/.afl/logs/afl-andon.log` at debug level.
 
 When the window is closed from the GUI, Andon asks for confirmation before it
 sends the normal stop command to every launcher started or restarted during
-that Andon session. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers
-that were already running when Andon opened are not stopped.
+that Andon session. NAS-managed Tiled containers are disconnected instead of
+stopped. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers that were
+already running when Andon opened are not stopped.
 
 ## Prerequisites
 
@@ -93,14 +102,22 @@ Settings tab also provides buttons to change them at runtime.
 
 The Settings tab reads and writes one current configuration file at
 `~/.afl/configs/andon.config.json` (or the same path on the selected remote
-host). It does not modify AFL-automation's global `~/.afl/config.json` or
-embed driver custom configurations. The native Tiled browser may read the
-latest `tiled_api_key` from that global file as a read-only credential fallback
-when its selected Tiled YAML does not define `single_user_api_key`.
+host) and does not embed driver custom configurations. After a Tiled launcher
+passes its health check, Andon appends a record to AFL-automation's global
+`~/.afl/config.json` with that launcher's URL and API key. Drivers started later
+in the same session therefore use the active Tiled service. The native Tiled
+browser may also read the latest `tiled_api_key` from that global file as a
+credential fallback when its selected Tiled YAML does not define a key.
 
 When a launcher successfully starts or stops, Andon rewrites its current entry
 in the file's `launchers` object with the launcher details, `runtime_state`,
 and `started_at` or `stopped_at` timestamp. It does not retain prior snapshots.
+
+If a driver creates a live Screen session but its HTTP health check does not
+become ready in time (for example, while it retries an unavailable Tiled
+backend), Andon keeps the launch and log stream active. The process indicator
+remains active and the HTTP indicator is yellow until the API becomes
+reachable; the driver tab remains accessible during this degraded state.
 
 For a Module launcher, **Config file location** is a path on the computer
 running Andon. Andon verifies it before start. For a remote host, Andon copies
@@ -185,11 +202,79 @@ column choices are saved locally. Filter choices are read from Tiled's
 distinct-metadata endpoint; selecting **Data** or **Metadata** on an entry
 reads only that entry. These are read-only requests.
 
-If the Tiled YAML includes `authentication.single_user_api_key`, Andon reads
-it from the selected config file and sends it only to that launcher's Tiled
+For a locally managed profile, Andon reads
+`authentication.single_user_api_key`. For an external profile, it reads the
+top-level `api_key`. Andon sends the credential only to that launcher's Tiled
 API; it is not stored in `launchers.json` or exposed to the browser page. If
 the YAML has no key, Andon falls back to the latest `tiled_api_key` in the
 local `~/.afl/config.json`.
+
+### External Tiled server profile
+
+Andon distinguishes the two Tiled YAML forms automatically:
+
+- A native service configuration containing `trees` is locally managed. Andon
+  can start and stop it with `tiled serve config`.
+- A client profile containing `uri` connects to an existing service. Its
+  `management` block selects how Andon controls that service.
+
+For example, a Synology-hosted service can use:
+
+```yaml
+authentication:
+  single_user_api_key: "replace-with-the-server-api-key"
+uvicorn:
+  host: "0.0.0.0"
+  port: 8000
+structure_clients: "dask"
+management:
+  type: "docker_compose"
+  authentication: "password"
+  host: "192.0.2.10"
+  username: "nas-user"
+  project_directory: "/srv/tiled-project"
+  service: "tiled"
+  join_shell: "/bin/sh"
+```
+
+This mirrors the authentication and Uvicorn sections in `tiled_local.yml`.
+For a NAS profile, Andon derives the public HTTP endpoint from
+`management.host` and `uvicorn.port`; the `management` section is the only
+additional lifecycle configuration.
+
+Local and NAS-backed Tiled launchers use the same connection summary on the
+Andon board: `SSH: username@host, HTTP: host:port`. The selected YAML profile
+still determines whether lifecycle management uses Screen or Docker Compose.
+
+Because this YAML contains a credential, keep it out of Git and make it
+readable only by the account running Andon (for example, mode `0600`). The
+`management` block makes Start and Restart operate on the named Docker Compose
+service over SSH, while View Log reads service logs and Join opens `join_shell`
+inside the container. Stop only disconnects Andon's status polling, embedded
+browser, log stream, and interactive SSH session; it does not stop or alter the
+NAS container. The
+SSH account must accept the selected authentication
+method and have permission to run `sudo`. Docker Compose is never invoked as
+the login user: Andon opens a root login shell with `sudo -i` and supplies the
+same in-memory password over SSH standard input.
+When `management.authentication` is `password`, clicking Start prompts for the
+SSH password. Andon keeps it only in process memory for subsequent status,
+log, and Join connections and discards it when Andon exits. Both SSH password
+and keyboard-interactive password login are supported; the latter is commonly
+used by Synology DSM even when an interactive `ssh` command simply says
+`Password:`.
+
+Before Start runs `docker compose up`, Andon verifies that
+`project_directory` exists and that the named `service` is declared by the
+Compose project. If that service is already running, Start leaves it untouched.
+Missing projects or services are reported as configuration errors and Andon
+does not create a replacement deployment.
+
+Use one **Tiled** launcher and select either the local service YAML or the
+external client YAML in its **Config file location** field. A native `trees`
+profile uses the existing Screen-based controls; an external profile with
+`management.type: docker_compose` uses the remote container controls. No
+second server type or launcher is needed.
 
 ## Building
 
