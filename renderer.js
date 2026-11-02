@@ -31,6 +31,7 @@ try {
 }
 
 let config;
+let configLocationOptions = { enabled: false, files: [] };
 let editingServer = null;
 let aflConfig = {};
 let aflConfigEditor;
@@ -399,8 +400,13 @@ function closeTerminalModal() {
 async function loadConfig() {
   log.debug('Loading configuration');
   config = await ipcRenderer.invoke('get-config');
-  const serverCount = Object.keys(config || {}).length;
+  configLocationOptions = await ipcRenderer.invoke('get-config-location-options');
+  const serverCount = serverNames().length;
   log.info(`Configuration loaded: ${serverCount} servers`);
+}
+
+function serverNames() {
+  return Object.keys(config || {}).filter(name => name !== 'configs_locations');
 }
 
 async function loadAflConfig() {
@@ -854,7 +860,7 @@ function createServerTabs() {
   tabList.appendChild(logsLi);
   
   let activeCount = 0;
-  Object.keys(config).forEach(serverName => {
+  serverNames().forEach(serverName => {
     const serverConfig = config[serverName];
     if (!serverConfig.active) return; // skip disabled servers
     activeCount++;
@@ -1132,8 +1138,30 @@ function openServerModal(serverName = null) {
   }
 
   updateServerTypeFields();
+  updateConfigLocationOptions();
   updateEnvTypeFields();
   modal.style.display = 'block';
+}
+
+function updateConfigLocationOptions() {
+  const select = document.getElementById('server-config-location-select');
+  const group = document.getElementById('config-location-select-group');
+  const configInput = document.getElementById('server-config-file-location');
+  const currentPath = configInput.value;
+
+  const { enabled, files } = configLocationOptions;
+  group.style.display = enabled ? 'block' : 'none';
+  select.replaceChildren();
+  select.appendChild(new Option('Direct path', ''));
+  for (const configPath of files) {
+    select.appendChild(new Option(configPath, configPath));
+  }
+  select.value = files.includes(currentPath) ? currentPath : '';
+}
+
+function selectConfigLocation() {
+  const selectedPath = document.getElementById('server-config-location-select').value;
+  if (selectedPath) document.getElementById('server-config-file-location').value = selectedPath;
 }
 
 function updateServerTypeFields() {
@@ -1269,7 +1297,7 @@ function renderServers() {
   setActiveTab(activeTab || 'andon');
 
   // Sort servers: active first, then alphabetically
-  const sortedServers = Object.keys(config).sort((a, b) => {
+  const sortedServers = serverNames().sort((a, b) => {
     if (config[a].active === config[b].active) {
       return a.localeCompare(b);
     }

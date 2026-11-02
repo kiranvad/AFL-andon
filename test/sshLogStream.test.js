@@ -158,6 +158,57 @@ test('keeps a live Screen driver accessible when HTTP health is unavailable', as
   assert.match(result.warning, /HTTP is not reachable/);
 });
 
+test('passes the configured HTTP port to an AFL module launcher', async () => {
+  const operations = new SSHOperations('/tmp/config', '/tmp/key');
+  operations.config = {
+    camera: {
+      host: 'localhost',
+      username: 'user',
+      httpPort: 5095,
+      screen_name: 'camera',
+      server_module: 'AFL.automation.vision.RGBCamera -i',
+      shell: 'bash'
+    }
+  };
+  operations.getRemoteOs = async () => 'linux';
+  const commands = [];
+  operations.executeCommand = async (_name, command) => {
+    commands.push(command);
+    return { success: true, output: '', code: 0 };
+  };
+  operations.waitForServerHealth = async () => ({ ok: true });
+  operations.ensureScreenDetached = async () => ({ ok: true });
+  operations.updateAndonRuntimeConfig = async () => ({ success: true });
+
+  const result = await operations.startServer('camera');
+
+  assert.equal(result.success, true);
+  assert.match(commands[0], /python -m AFL\.automation\.vision\.RGBCamera -i --port 5095/);
+});
+
+test('rejects an invalid HTTP port before launching an AFL module', async () => {
+  const operations = new SSHOperations('/tmp/config', '/tmp/key');
+  operations.config = {
+    camera: {
+      host: 'localhost',
+      username: 'user',
+      httpPort: 70000,
+      screen_name: 'camera',
+      server_module: 'AFL.automation.vision.RGBCamera',
+      shell: 'bash'
+    }
+  };
+  operations.getRemoteOs = async () => 'linux';
+  operations.executeCommand = async () => {
+    assert.fail('invalid ports must not execute a launch command');
+  };
+
+  const result = await operations.startServer('camera');
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /Invalid HTTP port/);
+});
+
 test('fails startup when neither HTTP nor the Screen process survives', async () => {
   const operations = new SSHOperations('/tmp/config', '/tmp/key');
   operations.config = {

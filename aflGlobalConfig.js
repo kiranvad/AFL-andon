@@ -38,26 +38,21 @@ function newestRecord(config) {
     : {};
 }
 
-async function updateAflTiledConfig(configPath, tiledServer, tiledApiKey, options = {}) {
+function appendAflTiledConfig(config, tiledServer, tiledApiKey, options = {}) {
   const url = new URL(String(tiledServer || '').trim());
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new Error('The active Tiled server must use HTTP or HTTPS.');
   }
+  // AFL's Tiled client expects the service root and receives its API key as a
+  // separate argument. A browser URL here (for example /ui/browse?api_key=...)
+  // makes tiled.client.from_uri reject the duplicated credential before the
+  // driver can create its data backend.
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
 
-  let config = {};
-  let mode = 0o600;
-  try {
-    const [contents, stat] = await Promise.all([
-      fs.readFile(configPath, 'utf8'),
-      fs.stat(configPath)
-    ]);
-    config = JSON.parse(contents);
-    mode = stat.mode & 0o777;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
   if (!config || typeof config !== 'object' || Array.isArray(config)) {
-    throw new Error(`AFL global config ${configPath} must contain a JSON object.`);
+    throw new Error('AFL global config must contain a JSON object.');
   }
 
   const record = {
@@ -72,18 +67,44 @@ async function updateAflTiledConfig(configPath, tiledServer, tiledApiKey, option
     suffix += 1;
     timestamp = formatTimestamp(now, suffix);
   }
-  config[timestamp] = record;
+
+  return {
+    timestamp,
+    record,
+    config: { ...config, [timestamp]: record }
+  };
+}
+
+async function updateAflTiledConfig(configPath, tiledServer, tiledApiKey, options = {}) {
+  let config = {};
+  let mode = 0o600;
+
+  try {
+    const [contents, stat] = await Promise.all([
+      fs.readFile(configPath, 'utf8'),
+      fs.stat(configPath)
+    ]);
+    config = JSON.parse(contents);
+    mode = stat.mode & 0o777;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error(`AFL global config ${configPath} must contain a JSON object.`);
+  }
+
+  const updated = appendAflTiledConfig(config, tiledServer, tiledApiKey, options);
 
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   const temporaryPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
   try {
-    await fs.writeFile(temporaryPath, `${JSON.stringify(config, null, 4)}\n`, { mode });
+    await fs.writeFile(temporaryPath, `${JSON.stringify(updated.config, null, 4)}\n`, { mode });
     await fs.rename(temporaryPath, configPath);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true }).catch(() => {});
     throw error;
   }
-  return { timestamp, record };
+  return { timestamp: updated.timestamp, record: updated.record };
 }
 
-module.exports = { formatTimestamp, updateAflTiledConfig };
+module.exports = { appendAflTiledConfig, formatTimestamp, updateAflTiledConfig };

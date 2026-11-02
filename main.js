@@ -929,9 +929,30 @@ ipcMain.handle('import-ssh-key', async () => {
 ipcMain.handle('get-config', async () => {
   log.debug('IPC: get-config');
   await sshOps.loadConfig();  // Reload config before sending
-  const serverCount = Object.keys(sshOps.config).length;
+  const serverCount = Object.keys(sshOps.config).filter(name => name !== 'configs_locations').length;
   log.debug(`get-config: Returning config with ${serverCount} servers`);
   return sshOps.config;
+});
+
+ipcMain.handle('get-config-location-options', async () => {
+  const configuredDirectory = sshOps.config.configs_locations;
+  if (typeof configuredDirectory !== 'string' || !configuredDirectory.trim()) {
+    return { enabled: false, files: [] };
+  }
+
+  const directory = path.resolve(path.dirname(sshOps.configPath), configuredDirectory.trim());
+  try {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    const files = entries
+      .filter(entry => entry.isFile())
+      .map(entry => path.join(directory, entry.name))
+      .sort((a, b) => a.localeCompare(b));
+    log.debug(`Found ${files.length} config-location options in ${directory}`);
+    return { enabled: true, files };
+  } catch (error) {
+    log.warn(`Configured config-locations directory is unavailable (${directory}): ${error.message}`);
+    return { enabled: false, files: [] };
+  }
 });
 
 // These endpoints are intentionally restricted to a Tiled-type launcher (with

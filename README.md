@@ -100,6 +100,20 @@ By default the app uses `~/.afl/launchers.json` for server definitions and
 variables or via `--config` and `--ssh-key` command‑line options.  The
 Settings tab also provides buttons to change them at runtime.
 
+To offer common local config files while adding or editing a launcher, add a
+top-level `configs_locations` entry to `launchers.json` with a directory path:
+
+```json
+{
+  "configs_locations": "/path/to/configs",
+  "my-server": { "...": "..." }
+}
+```
+
+When that value is nonempty and the directory exists, Andon shows its files in
+the **Config location** menu, alongside **Direct path** for a manually entered
+path. Relative directory paths are resolved relative to `launchers.json`.
+
 The Settings tab reads and writes one current configuration file at
 `~/.afl/configs/andon.config.json` (or the same path on the selected remote
 host) and does not embed driver custom configurations. After a Tiled launcher
@@ -124,7 +138,9 @@ running Andon. Andon verifies it before start. For a remote host, Andon copies
 the file to `~/.afl/configs/` on that host and starts the module with
 `--config` pointing to the copied file. For `localhost`, Andon uses the local
 path directly. Leaving the field empty preserves the module's default
-persistent configuration behavior.
+persistent configuration behavior. Andon also passes the launcher's **HTTP
+Port** to AFL as `--port`, so the server and Andon's health checks use the same
+endpoint.
 
 ## Localhost SSH Setup
 

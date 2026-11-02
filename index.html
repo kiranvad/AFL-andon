@@ -709,6 +709,10 @@
                     <label for="server-config-file-location">Config file location:</label>
                     <input type="text" id="server-config-file-location" placeholder="/path/to/server-config.json">
                 </div>
+                <div class="form-group" id="config-location-select-group" style="display: none;">
+                    <label for="server-config-location-select">Config location:</label>
+                    <select id="server-config-location-select" onchange="selectConfigLocation()"></select>
+                </div>
                 <div class="form-group">
                     <label for="server-shell">Shell:</label>
                     <input type="text" id="server-shell" value="bash">

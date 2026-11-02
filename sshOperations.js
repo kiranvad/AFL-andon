@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 const { createLogger } = require('./logger');
 const { loadTiledProfile } = require('./tiled/profile');
-const { updateAflTiledConfig } = require('./aflGlobalConfig');
+const { appendAflTiledConfig, updateAflTiledConfig } = require('./aflGlobalConfig');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
@@ -70,6 +70,7 @@ class SSHOperations {
     this.configPath = configPath;
     this.screenSessionCache = {}; // Cache for screen sessions by host
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
+    this.activeTiledConnection = null;
     log.debug(`SSHOperations created with configPath=${configPath}, sshKeyPath=${sshKeyPath}`);
   }
 
@@ -576,14 +577,25 @@ class SSHOperations {
       `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
   }
 
+  getTiledApiBaseUrl(serverName, profile) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig) throw new Error(`Server not found: ${serverName}`);
+
+    // Native Tiled service profiles intentionally have no `uri`. The
+    // webview URL is only for people and may contain /ui/browse plus an API
+    // key, so it must never be handed to AFL drivers as their API endpoint.
+    const endpoint = profile?.uri ||
+      `http://${serverConfig.host}:${serverConfig.httpPort || 8000}/`;
+    return new URL('/', endpoint).toString();
+  }
+
   async probeServerHealth(serverName) {
     const serverConfig = this.config[serverName];
     if (serverConfig?.server_type === 'tiled') {
       let timer;
       try {
         const profile = await loadTiledProfile(serverConfig.config_file_location);
-        const baseUrl = profile.uri || serverConfig.webview_url ||
-          `http://${serverConfig.host}:${serverConfig.httpPort}/`;
+        const baseUrl = this.getTiledApiBaseUrl(serverName, profile);
         const url = new URL('api/v1/metadata/', baseUrl).toString();
         const controller = new AbortController();
         timer = setTimeout(() => controller.abort(), 3000);
@@ -637,15 +649,152 @@ class SSHOperations {
     if (serverConfig?.server_type !== 'tiled') return null;
 
     const profile = await loadTiledProfile(serverConfig.config_file_location);
-    const tiledServer = profile.uri || serverConfig.webview_url ||
-      `http://${serverConfig.host}:${serverConfig.httpPort || 8000}/`;
+    const tiledServer = this.getTiledApiBaseUrl(serverName, profile);
     const result = await updateAflTiledConfig(
       this.aflGlobalConfigPath,
       tiledServer,
       profile.apiKey
     );
+    this.activeTiledConnection = {
+      serverName,
+      tiledServer: result.record.tiled_server,
+      tiledApiKey: result.record.tiled_api_key
+    };
     log.info(`${serverName}: Activated ${result.record.tiled_server} in AFL global config ${this.aflGlobalConfigPath}`);
     return result;
+  }
+
+  async getRemoteReachableTiledUrl(serverName, tiledServer) {
+    const url = new URL(tiledServer);
+    if (!isLocalHost(url.hostname)) return url.toString().replace(/\/$/, '');
+
+    const connection = await this.executeCommand(
+      serverName,
+      `printf '%s\\n' "$SSH_CONNECTION"`,
+      5000,
+      { quiet: true }
+    );
+    if (!connection.success || (connection.code !== 0 && connection.code !== null)) {
+      throw new Error(connection.error || 'could not determine the workstation address from SSH');
+    }
+    const clientAddress = String(connection.output || '').trim().split(/\s+/)[0];
+    if (!clientAddress) {
+      throw new Error('the remote SSH session did not report a workstation address');
+    }
+    url.hostname = clientAddress.includes(':') ? `[${clientAddress}]` : clientAddress;
+    return url.toString().replace(/\/$/, '');
+  }
+
+  async discoverActiveTiledConnection() {
+    if (this.activeTiledConnection) return this.activeTiledConnection;
+
+    const tiledServers = Object.keys(this.config).filter(name =>
+      this.config[name]?.server_type === 'tiled' && this.config[name]?.active !== false
+    );
+    for (const tiledServerName of tiledServers) {
+      const health = await this.probeServerHealth(tiledServerName);
+      if (!health.ok) continue;
+      try {
+        await this.activateTiledForSession(tiledServerName);
+        return this.activeTiledConnection;
+      } catch (error) {
+        log.warn(`${tiledServerName}: Could not activate reachable Tiled service for drivers: ${error.message}`);
+      }
+    }
+    return null;
+  }
+
+  async probeTiledFromDriverHost(serverName, tiledServer, tiledApiKey) {
+    const metadataUrl = new URL('api/v1/metadata/', `${tiledServer.replace(/\/$/, '')}/`).toString();
+    const authenticated = Boolean(String(tiledApiKey || '').trim());
+    const command = authenticated
+      ? `IFS= read -r TILED_API_KEY; curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 --header "Authorization: Apikey $TILED_API_KEY" ${shellQuote(metadataUrl)}`
+      : `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(metadataUrl)}`;
+    const result = await this.executeCommand(
+      serverName,
+      command,
+      5000,
+      { quiet: true, ...(authenticated ? { stdin: `${tiledApiKey}\n` } : {}) }
+    );
+    const statusCode = String(result.output || '').trim().match(/\d{3}$/)?.[0];
+    if (!result.success || result.code !== 0 || !statusCode || Number(statusCode) < 200 || Number(statusCode) >= 300) {
+      return {
+        success: false,
+        error: result.error || (statusCode
+          ? `Tiled returned HTTP ${statusCode}`
+          : 'Tiled did not return an HTTP status')
+      };
+    }
+    return { success: true, metadataUrl, statusCode: Number(statusCode) };
+  }
+
+  async syncActiveTiledConfigForDriver(serverName) {
+    const serverConfig = this.config[serverName];
+    if (!serverConfig?.server_module) return { success: true, skipped: true };
+
+    const active = await this.discoverActiveTiledConnection();
+    if (!active) {
+      log.info(`${serverName}: Tiled connection was not initiated; no active Tiled service was found`);
+      return { success: true, skipped: true };
+    }
+
+    let tiledServer = active.tiledServer;
+    try {
+      if (!isLocalHost(serverConfig.host)) {
+        tiledServer = await this.getRemoteReachableTiledUrl(serverName, active.tiledServer);
+      }
+    } catch (error) {
+      const message = `Tiled connection failed before launch; address ${active.tiledServer}: could not resolve it for ${serverConfig.host}: ${error.message}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer: active.tiledServer };
+    }
+
+    const reachable = await this.probeTiledFromDriverHost(serverName, tiledServer, active.tiledApiKey);
+    if (!reachable.success) {
+      const message = `Tiled connection failed before launch; address ${tiledServer}: ${reachable.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer };
+    }
+
+    if (isLocalHost(serverConfig.host)) {
+      log.info(`${serverName}: Tiled connectivity verified before launch at ${tiledServer}`);
+      return { success: true, tiledServer, verified: true };
+    }
+
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
+    const remotePath = `${homePath}/.afl/config.json`;
+    const existing = await this.readRemoteFile(serverConfig.host, remotePath);
+    let config = {};
+    if (existing.success) {
+      try {
+        config = JSON.parse(existing.data);
+      } catch (error) {
+        return { success: false, error: `Remote AFL global config ${remotePath} is invalid JSON: ${error.message}` };
+      }
+    } else if (!/no such file|enoent/i.test(existing.error || '')) {
+      return { success: false, error: `Could not read remote AFL global config ${remotePath}: ${existing.error}` };
+    }
+
+    let updated;
+    try {
+      updated = appendAflTiledConfig(config, tiledServer, active.tiledApiKey);
+    } catch (error) {
+      return { success: false, error: `Could not update remote AFL global config ${remotePath}: ${error.message}` };
+    }
+    const written = await this.writeRemoteFile(
+      serverConfig.host,
+      remotePath,
+      `${JSON.stringify(updated.config, null, 4)}\n`
+    );
+    if (!written.success) {
+      const message = `Tiled connection configuration failed for ${tiledServer}: could not write ${remotePath}: ${written.error}`;
+      log.error(`${serverName}: ${message}`);
+      return { success: false, error: message, tiledServer };
+    }
+
+    log.info(`${serverName}: Activated ${updated.record.tiled_server} in remote AFL global config ${remotePath}`);
+    log.info(`${serverName}: Tiled connectivity verified before launch at ${updated.record.tiled_server}`);
+    return { success: true, tiledServer: updated.record.tiled_server, remotePath, verified: true };
   }
 
   async ensureScreenDetached(serverName) {
@@ -852,6 +1001,18 @@ class SSHOperations {
       if (!configResult.success) return configResult;
       launchConfigPath = configResult.configPath;
     }
+
+    if (serverConfig.server_module) {
+      const tiledConfig = await this.syncActiveTiledConfigForDriver(serverName);
+      if (!tiledConfig.success) {
+        const error = `Driver was not launched because its Tiled configuration could not be synchronized: ${tiledConfig.error}`;
+        log.error(`${serverName}: ${error}`);
+        return {
+          success: false,
+          error
+        };
+      }
+    }
     
     // Detect remote OS to use appropriate screen options
     const remoteOs = await this.getRemoteOs(serverName);
@@ -876,7 +1037,14 @@ class SSHOperations {
     }
 
     if (serverConfig.server_module) {
-      let command = `python -m ${serverConfig.server_module}`;
+      const httpPort = Number(serverConfig.httpPort);
+      if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
+        return {
+          success: false,
+          error: `Invalid HTTP port for ${serverName}: ${serverConfig.httpPort}`
+        };
+      }
+      let command = `python -m ${serverConfig.server_module} --port ${httpPort}`;
       if (launchConfigPath) {
         command += ` --config ${shellQuote(launchConfigPath)}`;
         log.info(`${serverName}: Launching server with provided config file ${launchConfigPath}`);
@@ -1104,6 +1272,9 @@ class SSHOperations {
     
     if (result.success) {
       log.info(`${serverName}: Server stopped successfully`);
+      if (serverConfig.server_type === 'tiled' && this.activeTiledConnection?.serverName === serverName) {
+        this.activeTiledConnection = null;
+      }
       const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
       if (!runtimeConfig.success) {
         log.error(`${serverName}: Andon runtime config could not be updated after stop: ${runtimeConfig.error || 'unknown error'}`);
