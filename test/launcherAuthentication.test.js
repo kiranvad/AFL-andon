@@ -11,11 +11,13 @@ const root = path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 const renderer = fs.readFileSync(path.join(root, 'renderer.js'), 'utf8');
 
-function createRenderer(launchers, invoke = async () => ({ available: false, success: true })) {
+function createRenderer(launchers, invoke = async () => ({ available: false, success: true }), locations = { enabled: false, files: [] }) {
   // Exercise the real renderer functions using the IDs in the actual HTML.
   const elements = Object.fromEntries([...html.matchAll(/id="([^"]+)"/g)].map(([, id]) => [id, {
-    value: '', checked: false, style: {}, dataset: {},
+    value: '', checked: false, style: {}, dataset: {}, children: [],
     focus() {},
+    replaceChildren() { this.children = []; },
+    appendChild(child) { this.children.push(child); },
     closest() { return { style: {} }; }
   }]));
   const form = elements['server-form'];
@@ -29,7 +31,8 @@ function createRenderer(launchers, invoke = async () => ({ available: false, suc
   const saved = [];
   const logger = Object.fromEntries(['info', 'debug', 'warn', 'error'].map(level => [level, () => {}]));
   const context = vm.createContext({
-    launchers, saved, global: {}, __dirname: root,
+    launchers, saved, locations, global: {}, __dirname: root,
+    Option: function(text, value) { this.textContent = text; this.value = value; },
     document: {
       getElementById: id => elements[id], addEventListener() {},
       createElement() { return { children: [], appendChild(child) { this.children.push(child); } }; }
@@ -47,10 +50,46 @@ function createRenderer(launchers, invoke = async () => ({ available: false, suc
   vm.runInContext(renderer, context, { filename: 'renderer.js' });
   vm.runInContext(`
     config = launchers;
+    configLocationOptions = locations;
     addServer = updateServer = async (name, server) => saved.push({ name, server });
   `, context);
   return { context, elements, form, saved };
 }
+
+test('config-location choices preserve authentication and stay out of script launches', async () => {
+  const { context, elements, form, saved } = createRenderer({
+    configs_locations: '/profiles',
+    agent: {
+      host: 'worker.example', username: 'test-user', httpPort: 5050, screen_name: 'AgentServer', active: true,
+      server_module: 'AFL.double_agent.AgentDriver', ssh_authentication: 'password', config_file_location: '/profiles/original.json'
+    }
+  }, undefined, { enabled: true, files: ['/profiles/original.json', '/profiles/selected.json'] });
+  assert.deepEqual(Array.from(context.serverNames()), ['agent']);
+  context.openServerModal('agent');
+  const select = elements['server-config-location-select'];
+  assert.equal(elements['config-location-select-group'].style.display, 'block');
+  assert.deepEqual(select.children.map(child => child.value), ['', '/profiles/original.json', '/profiles/selected.json']);
+  assert.equal(select.value, '/profiles/original.json');
+  select.value = '/profiles/selected.json';
+  context.selectConfigLocation();
+  await context.handleServerFormSubmit({ preventDefault() {}, target: form });
+  assert.equal(saved[0].server.config_file_location, '/profiles/selected.json');
+  assert.equal(saved[0].server.ssh_authentication, 'password');
+
+  elements['server-type'].value = 'script';
+  elements['server-script'].value = '/opt/agent/start.sh';
+  context.updateServerTypeFields();
+  assert.equal(elements['config-location-select-group'].style.display, 'none');
+  await context.handleServerFormSubmit({ preventDefault() {}, target: form });
+  assert.equal(saved[1].server.config_file_location, '');
+  assert.equal(saved[1].server.server_module, '');
+  assert.equal(saved[1].server.server_script, '/opt/agent/start.sh');
+  assert.equal(saved[1].server.ssh_authentication, 'password');
+
+  elements['server-type'].value = 'tiled';
+  context.updateServerTypeFields();
+  assert.equal(elements['config-location-select-group'].style.display, 'block');
+});
 
 for (const launcher of [
   { server_module: 'AFL.double_agent.AgentDriver' },

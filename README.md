@@ -126,6 +126,20 @@ Tiled launchers without this field retain that YAML setting; other launchers
 without this field default to SSH keys. Session passwords are shared by
 launchers using the same host, username, and SSH port.
 
+To offer common local config files while adding or editing a launcher, add a
+top-level `configs_locations` entry to `launchers.json` with a directory path:
+
+```json
+{
+  "configs_locations": "/path/to/configs",
+  "my-server": { "...": "..." }
+}
+```
+
+When that value is nonempty and the directory exists, Andon shows its files in
+the **Config location** menu, alongside **Direct path** for a manually entered
+path. Relative directory paths are resolved relative to `launchers.json`.
+
 The Settings tab reads and writes one current configuration file at
 `~/.afl/configs/andon.config.json` (or the same path on the selected remote
 host) and does not embed driver custom configurations. After a Tiled launcher
@@ -138,8 +152,9 @@ ports. Remote drivers using HTTP Tiled connect through an SSH tunnel managed
 by Andon: the driver connects to a loopback port on its own host, and the
 control computer forwards traffic to the selected Tiled service. This works
 when the control computer can reach Tiled but the driver host cannot. After
-reopening Andon, a running card named **tiled** is also recognized
-as the current service. The native Tiled
+reopening Andon, it discovers a healthy enabled Tiled card, preferring a card
+named **tiled**. Before launch, Andon verifies authenticated Tiled access from
+the driver's SSH account through the selected endpoint or tunnel. The native Tiled
 browser may also read the latest `tiled_api_key` from that global file as a
 credential fallback when its selected Tiled YAML does not define a key.
 
@@ -158,7 +173,9 @@ running Andon. Andon verifies it before start. For a remote host, Andon copies
 the file to `~/.afl/configs/` on that host and starts the module with
 `--config` pointing to the copied file. For `localhost`, Andon uses the local
 path directly. Leaving the field empty preserves the module's default
-persistent configuration behavior.
+persistent configuration behavior. Andon also passes the launcher's **HTTP
+Port** to AFL as `--port`, so the server and Andon's health checks use the same
+endpoint.
 
 ### Launching a local script on a server
 
@@ -179,7 +196,7 @@ Local script paths are saved only as `script_file_location`. The legacy
 removes duplicate script paths when saving the launcher configuration.
 
 The card's **HTTP Port** is passed to Module and Script launches as
-`AFL_HTTP_PORT`. AFL's shared launcher uses this value ahead of its saved
+`AFL_HTTP_PORT`; Module launches also receive `--port`. AFL's shared launcher uses this value ahead of its saved
 `ports` mapping and default port, so scripts that use the AFL launcher need
 no separate port setting. The server's AFL-automation installation must
 include support for `AFL_HTTP_PORT`. Custom servers can read the same

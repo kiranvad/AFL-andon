@@ -40,3 +40,18 @@ test('updates Tiled settings by appending an AFL configuration record', async t 
     ports: { RGBCamera: 5095 }
   });
 });
+
+test('stores only the Tiled API root when given a browser URL', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'andon-afl-config-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const configPath = path.join(directory, 'config.json');
+
+  const result = await updateAflTiledConfig(
+    configPath,
+    'http://localhost:8000/ui/browse?api_key=uri-key#results',
+    'config-key'
+  );
+
+  assert.equal(result.record.tiled_server, 'http://localhost:8000');
+  assert.equal(result.record.tiled_api_key, 'config-key');
+});

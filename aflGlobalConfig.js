@@ -43,6 +43,14 @@ function appendAflTiledConfig(config, tiledServer, tiledApiKey, options = {}) {
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new Error('The active Tiled server must use HTTP or HTTPS.');
   }
+  // AFL's Tiled client expects the service root and receives its API key as a
+  // separate argument. A browser URL here (for example /ui/browse?api_key=...)
+  // makes tiled.client.from_uri reject the duplicated credential before the
+  // driver can create its data backend.
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+
   if (!config || typeof config !== 'object' || Array.isArray(config)) {
     throw new Error('AFL global config must contain a JSON object.');
   }
@@ -59,12 +67,18 @@ function appendAflTiledConfig(config, tiledServer, tiledApiKey, options = {}) {
     suffix += 1;
     timestamp = formatTimestamp(now, suffix);
   }
-  return { timestamp, record, config: { ...config, [timestamp]: record } };
+
+  return {
+    timestamp,
+    record,
+    config: { ...config, [timestamp]: record }
+  };
 }
 
 async function updateAflTiledConfig(configPath, tiledServer, tiledApiKey, options = {}) {
   let config = {};
   let mode = 0o600;
+
   try {
     const [contents, stat] = await Promise.all([
       fs.readFile(configPath, 'utf8'),
@@ -75,18 +89,22 @@ async function updateAflTiledConfig(configPath, tiledServer, tiledApiKey, option
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const result = appendAflTiledConfig(config, tiledServer, tiledApiKey, options);
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error(`AFL global config ${configPath} must contain a JSON object.`);
+  }
+
+  const updated = appendAflTiledConfig(config, tiledServer, tiledApiKey, options);
 
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   const temporaryPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
   try {
-    await fs.writeFile(temporaryPath, `${JSON.stringify(result.config, null, 4)}\n`, { mode });
+    await fs.writeFile(temporaryPath, `${JSON.stringify(updated.config, null, 4)}\n`, { mode });
     await fs.rename(temporaryPath, configPath);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true }).catch(() => {});
     throw error;
   }
-  return { timestamp: result.timestamp, record: result.record };
+  return { timestamp: updated.timestamp, record: updated.record };
 }
 
-module.exports = { formatTimestamp, appendAflTiledConfig, updateAflTiledConfig };
+module.exports = { appendAflTiledConfig, formatTimestamp, updateAflTiledConfig };

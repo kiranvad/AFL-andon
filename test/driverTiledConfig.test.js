@@ -56,7 +56,7 @@ async function setup(t, renameError = null) {
   operations.executeCommand = async (name, command) => {
     assert.equal(name, 'worker');
     commands.push(command);
-    return { success: true, code: 0, output: command.includes('SSH_CONNECTION') ? '192.0.2.20' : '' };
+    return { success: true, code: 0, output: command.includes('SSH_CONNECTION') ? '192.0.2.20' : command.includes('api/v1/metadata/') ? '200' : '' };
   };
   operations.getRemoteOs = async () => 'linux';
   operations.probeServerHealth = async name => { assert.equal(name, 'tiled'); return { ok: true }; };
@@ -232,4 +232,42 @@ test('HTTPS Tiled preserves direct connections and its TLS hostname', async t =>
   await operations.configureTiledForLaunch('worker');
   assert.equal(Object.values(JSON.parse(files.get(globalPath))).at(-1).tiled_server, 'https://tiled.example');
   assert.equal(forwards.length, 0);
+});
+
+test('after reopening, any healthy enabled Tiled card is discovered for a driver', async t => {
+  const { operations, files, globalPath } = await setup(t);
+  operations.config.catalog = operations.config.tiled;
+  delete operations.config.tiled;
+  operations.probeServerHealth = async name => { assert.equal(name, 'catalog'); return { ok: true }; };
+  const result = await operations.syncActiveTiledConfigForDriver('worker');
+  assert.equal(result.success, true);
+  assert.equal(result.verified, true);
+  assert.equal(operations.activeTiledServerName, 'catalog');
+  assert.equal(operations.activeTiledConnection.serverName, 'catalog');
+  assert.equal(Object.values(JSON.parse(files.get(globalPath))).at(-1).tiled_server, 'http://127.0.0.1:38123');
+});
+
+test('browser paths and URL credentials never enter driver Tiled configuration', async t => {
+  const { operations, files, globalPath, commands } = await setup(t);
+  operations.config.tiled.webview_url = 'http://localhost:8111/ui/browse?api_key=browser-key#results';
+  assert.equal((await operations.syncActiveTiledConfigForDriver('worker')).success, true);
+  const tunnel = [...operations.tiledTunnels.values()][0];
+  assert.equal(tunnel.target.toString(), 'http://localhost:8111/');
+  assert.equal(Object.values(JSON.parse(files.get(globalPath))).at(-1).tiled_server, 'http://127.0.0.1:38123');
+  assert.equal(commands.some(command => command.includes('browser-key') || command.includes('/ui/browse')), false);
+});
+
+test('an authenticated Tiled failure preserves config and prevents driver launch', async t => {
+  const { operations, files, globalPath, commands } = await setup(t);
+  const original = files.get(globalPath);
+  operations.executeCommand = async (_name, command) => {
+    commands.push(command);
+    return { success: true, code: 0, output: '401' };
+  };
+  const result = await operations.startServer('worker');
+  assert.equal(result.success, false);
+  assert.match(result.error, /Tiled returned HTTP 401/);
+  assert.equal(files.get(globalPath), original);
+  assert.equal(operations.tiledTunnels.size, 0);
+  assert.equal(commands.some(command => command.startsWith('screen -d -m')), false);
 });
