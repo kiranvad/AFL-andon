@@ -2,9 +2,12 @@ const { Client } = require('ssh2');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const { isIP } = require('node:net');
 const { createLogger } = require('./logger');
-const { loadTiledProfile } = require('./tiled/profile');
-const { updateAflTiledConfig } = require('./aflGlobalConfig');
+const { loadTiledProfile, isTiledProxy } = require('./tiled/profile');
+const { appendAflTiledConfig, updateAflTiledConfig } = require('./aflGlobalConfig');
+const { getSshAuthentication, getSshCredentialId } = require('./sshAuthentication');
+const TiledTunnel = require('./tiledTunnel');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
@@ -68,8 +71,11 @@ class SSHOperations {
     const aflHome = process.env.AFL_HOME?.trim() || path.join(os.homedir(), '.afl');
     this.aflGlobalConfigPath = options.aflGlobalConfigPath || path.join(aflHome, 'config.json');
     this.configPath = configPath;
-    this.screenSessionCache = {}; // Cache for screen sessions by host
+    this.screenSessionCache = {}; // Cache for screen sessions by SSH account and endpoint
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
+    this.tiledConfigUpdates = new Map();
+    this.tiledTunnels = new Map();
+    this.activeTiledServerName = null;
     log.debug(`SSHOperations created with configPath=${configPath}, sshKeyPath=${sshKeyPath}`);
   }
 
@@ -117,6 +123,10 @@ class SSHOperations {
           const profile = await loadTiledProfile(server.config_file_location, { loadApiKey: false });
           server.external_service = profile.mode === 'external';
           server.tiled_management = profile.management;
+          if (profile.mode === 'proxy') {
+            server.tiled_catalog_path = profile.catalogPath || server.tiled_catalog_path;
+            log.info(`${serverName}: Loaded AFL proxy profile for ${profile.uri}`);
+          }
           if (server.external_service) {
             server.tiled_profile_uri = profile.uri;
             server.tiled_catalog_path = profile.catalogPath || server.tiled_catalog_path;
@@ -146,6 +156,12 @@ class SSHOperations {
   async saveConfig() {
     log.debug(`Saving config to ${this.configPath}`);
     try {
+      // A local file is uploaded; server_script is only a server-side command.
+      // Empty fields from the editor clear old selections before serialization.
+      for (const server of Object.values(this.config)) {
+        if (server.script_file_location || !server.server_script) delete server.server_script;
+        if (!server.script_file_location) delete server.script_file_location;
+      }
       await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2));
       log.info(`Config saved successfully to ${this.configPath}`);
     } catch (error) {
@@ -195,7 +211,8 @@ class SSHOperations {
 
     this.sshKey = null;
     const triedPaths = candidatePaths.filter(Boolean);
-    log.error(`No valid SSH key found. Tried: ${triedPaths.join(', ')}`);
+    log.info('No SSH key found; password launchers can authenticate with a session password.');
+    log.debug(`SSH key paths tried: ${triedPaths.join(', ')}`);
   }
 
   getAvailableSSHKeys(host = null) {
@@ -247,8 +264,7 @@ class SSHOperations {
   }
 
   getCredentialId(serverName) {
-    const server = this.config[serverName];
-    return server ? `${server.username}@${server.host}` : '';
+    return getSshCredentialId(this.config[serverName]);
   }
 
   setSessionPassword(serverName, password) {
@@ -377,7 +393,8 @@ class SSHOperations {
     }
 
     const credentialId = this.getCredentialId(serverName);
-    const password = this.sessionPasswords.get(credentialId);
+    const passwordRequired = getSshAuthentication(serverConfig) === 'password';
+    const password = passwordRequired ? this.sessionPasswords.get(credentialId) : '';
     if (password) {
       try {
         const conn = await this.connectWithPassword(serverName, serverConfig, password, timeout, extraOptions);
@@ -391,7 +408,7 @@ class SSHOperations {
       }
     }
 
-    if (serverConfig.tiled_management?.authentication === 'password') {
+    if (passwordRequired) {
       const authenticationError = new Error(`SSH password required for ${credentialId}.`);
       authenticationError.code = 'SSH_AUTHENTICATION_REQUIRED';
       throw authenticationError;
@@ -436,12 +453,16 @@ class SSHOperations {
 
   removeServer(serverName) {
     log.info(`Removing server: ${serverName}`);
+    this.releaseTiledTunnels(serverName);
     delete this.config[serverName];
   }
 
   updateServer(serverName, serverConfig) {
     log.info(`Updating server: ${serverName}`);
     log.debug(`New config:`, serverConfig);
+    if (getSshCredentialId({ ...this.config[serverName], ...serverConfig }) !== this.getCredentialId(serverName)) {
+      this.releaseTiledTunnels(serverName);
+    }
     this.config[serverName] = { ...this.config[serverName], ...serverConfig };
   }
 
@@ -462,8 +483,8 @@ class SSHOperations {
       return { success: false, sshDown: true };
     }
 
-    if (this.getAvailableSSHKeys().length === 0 && !this.hasSessionPassword(serverName)) {
-      const passwordRequired = serverConfig.tiled_management?.authentication === 'password';
+    const passwordRequired = getSshAuthentication(serverConfig) === 'password';
+    if (passwordRequired ? !this.hasSessionPassword(serverName) : this.getAvailableSSHKeys().length === 0) {
       if (!options.quiet) log.error(`No SSH credential available for ${serverName}`);
       return {
         success: false,
@@ -552,10 +573,10 @@ class SSHOperations {
   }
 
   // Get the home directory path for a host based on its OS
-  async getRemoteHomePath(host, username) {
-    // Find a server on this host to detect OS
-    const serverName = Object.keys(this.config).find(name =>
-      this.config[name].host === host
+  async getRemoteHomePath(host, username, serverName = null) {
+    // Use the launcher's account when multiple users share a host.
+    serverName ||= Object.keys(this.config).find(name =>
+      this.config[name].host === host && this.config[name].username === username
     );
     
     if (!serverName) {
@@ -580,11 +601,12 @@ class SSHOperations {
     const serverConfig = this.config[serverName];
     if (serverConfig?.server_type === 'tiled') {
       let timer;
+      let url;
       try {
         const profile = await loadTiledProfile(serverConfig.config_file_location);
-        const baseUrl = profile.uri || serverConfig.webview_url ||
+        const baseUrl = (profile.mode !== 'proxy' && profile.uri) || serverConfig.webview_url ||
           `http://${serverConfig.host}:${serverConfig.httpPort}/`;
-        const url = new URL('api/v1/metadata/', baseUrl).toString();
+        url = new URL('api/v1/metadata/', baseUrl).toString();
         const controller = new AbortController();
         timer = setTimeout(() => controller.abort(), 3000);
         const response = await fetch(url, {
@@ -594,32 +616,31 @@ class SSHOperations {
           },
           signal: controller.signal
         });
+        await response.body?.cancel();
         return response.ok
           ? { ok: true, url, statusCode: response.status }
-          : { ok: false, url, statusCode: response.status, reason: `HTTP ${response.status}` };
+          : { ok: false, url, statusCode: response.status, reason: `HTTP ${response.status}${[401, 403].includes(response.status) ? ' — check the Tiled API key and its permissions in the profile' : ''}` };
       } catch (error) {
-        return { ok: false, url: serverConfig.tiled_profile_uri || serverConfig.webview_url, reason: error.message };
+        return { ok: false, url: url || serverConfig.tiled_profile_uri || serverConfig.webview_url, reason: error.message };
       } finally {
         clearTimeout(timer);
       }
     }
 
     const url = this.getStatusUrl(serverName);
-    const command = `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(url)}`;
-    const result = await this.executeCommand(serverName, command, 5000);
-    if (!result.success) return { ok: false, url, reason: result.error || 'SSH connection failed' };
-
-    const statusCode = (result.output || '').trim().match(/\d{3}$/)?.[0] || null;
-    if (result.code === 0 && statusCode && Number(statusCode) >= 200 && Number(statusCode) < 300) {
-      return { ok: true, url, statusCode: Number(statusCode) };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      await response.body?.cancel();
+      return response.ok
+        ? { ok: true, url, statusCode: response.status }
+        : { ok: false, url, statusCode: response.status, reason: `HTTP ${response.status}` };
+    } catch (error) {
+      return { ok: false, url, reason: error.message };
+    } finally {
+      clearTimeout(timer);
     }
-    const detail = (result.output || '').trim().replace(/\d{3}$/, '').trim();
-    return {
-      ok: false,
-      url,
-      statusCode: statusCode ? Number(statusCode) : null,
-      reason: detail || (statusCode ? `HTTP ${statusCode}` : 'connection failed')
-    };
   }
 
   async waitForServerHealth(serverName, attempts = 20, intervalMs = 1000) {
@@ -644,8 +665,136 @@ class SSHOperations {
       tiledServer,
       profile.apiKey
     );
+    this.activeTiledServerName = serverName;
     log.info(`${serverName}: Activated ${result.record.tiled_server} in AFL global config ${this.aflGlobalConfigPath}`);
     return result;
+  }
+
+  async configureTiledForLaunch(serverName) {
+    const serverConfig = this.config[serverName];
+    // The last Tiled started through Andon is the current service. After
+    // reopening Andon, reconnect to a running card named "tiled" if present.
+    const tiledName = this.activeTiledServerName || Object.keys(this.config).find(name =>
+      name.trim().toLowerCase() === 'tiled' && this.config[name].server_type === 'tiled'
+    );
+    if (!tiledName) return null;
+    const tiledConfig = this.config[tiledName];
+    if (tiledConfig?.server_type !== 'tiled') {
+      this.activeTiledServerName = null;
+      return null;
+    }
+    const health = await this.probeServerHealth(tiledName);
+    if (!health.ok) {
+      if (!this.activeTiledServerName) return null;
+      throw new Error(`Current Tiled launcher "${tiledName}" is unavailable: ${health.reason || 'health check failed'}`);
+    }
+    const profile = await loadTiledProfile(tiledConfig.config_file_location);
+    let url = new URL(profile.uri || tiledConfig.webview_url ||
+      `http://${tiledConfig.host}:${tiledConfig.httpPort || 8000}/`);
+
+    const localAccount = isLocalHost(serverConfig.host) && serverConfig.username === os.userInfo().username;
+    if (url.protocol === 'https:' && isLocalHost(url.hostname) && !isLocalHost(serverConfig.host)) {
+      let address = tiledConfig.host;
+      if (isLocalHost(address)) {
+        // SSH_CONNECTION's first field is the control computer as seen by the
+        // driver host. A control-side localhost URL must reach that computer.
+        const result = await this.executeCommand(serverName, 'printf \'%s\' "${SSH_CONNECTION%% *}"', 5000);
+        if (!result.success || result.code !== 0 || !isIP(result.output?.trim() || '')) {
+          throw new Error('Could not determine the control computer address for the current Tiled service.');
+        }
+        address = result.output.trim();
+      }
+      url.hostname = address.includes(':') && !address.startsWith('[') ? `[${address}]` : address;
+    }
+
+    // Serialize updates to one account so simultaneous driver starts preserve
+    // the existing global configuration and its history.
+    const account = this.getCredentialId(serverName);
+    const previous = this.tiledConfigUpdates.get(account) || Promise.resolve();
+    const update = previous.catch(() => {}).then(async () => {
+      let tunnel;
+      let addedOwner = false;
+      try {
+        if (!isLocalHost(serverConfig.host) && url.protocol === 'http:') {
+          ({ tunnel, addedOwner } = await this.ensureTiledTunnel(serverName, url));
+          url = tunnel.url;
+        }
+        if (localAccount) {
+          await updateAflTiledConfig(this.aflGlobalConfigPath, url.toString(), profile.apiKey);
+        } else {
+          const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username, serverName);
+          const remotePath = `${homePath}/.afl/config.json`;
+          const current = await this.readRemoteFile(serverConfig.host, remotePath, serverName);
+          if (!current.success && !/no such file|enoent/i.test(current.error || '')) {
+            throw new Error(`Could not read remote AFL global config: ${current.error}`);
+          }
+          const config = current.success ? JSON.parse(current.data) : {};
+          const result = appendAflTiledConfig(config, url.toString(), profile.apiKey);
+          const saved = await this.writeRemoteFile(
+            serverConfig.host, remotePath, `${JSON.stringify(result.config, null, 4)}\n`, serverName, { mode: 0o600, atomic: true }
+          );
+          if (!saved.success) throw new Error(`Could not update remote AFL global config: ${saved.error}`);
+        }
+        this.releaseTiledTunnels(serverName, tunnel);
+      } catch (error) {
+        if (addedOwner) this.releaseTiledTunnelOwner(tunnel, serverName);
+        throw error;
+      }
+    });
+    this.tiledConfigUpdates.set(account, update);
+    try {
+      await update;
+    } finally {
+      if (this.tiledConfigUpdates.get(account) === update) this.tiledConfigUpdates.delete(account);
+    }
+    log.info(`${serverName}: Configured Tiled launcher "${tiledName}" at ${url} for this driver`);
+  }
+
+  async ensureTiledTunnel(serverName, url) {
+    const account = this.getCredentialId(serverName);
+    const key = JSON.stringify([account, url.origin]);
+    let tunnel = this.tiledTunnels.get(key);
+    if (!tunnel) {
+      tunnel = new TiledTunnel({
+        targetUrl: url,
+        log,
+        connect: () => {
+          const owner = [...tunnel.serverNames].find(name => this.getCredentialId(name) === account);
+          if (!owner) throw new Error('No driver owns this Tiled tunnel.');
+          return this.connectWithAvailableKeys(owner, 10000, { keepaliveInterval: 10000, keepaliveCountMax: 3 });
+        }
+      });
+      this.tiledTunnels.set(key, tunnel);
+    }
+    const addedOwner = !tunnel.serverNames.has(serverName);
+    tunnel.serverNames.add(serverName);
+    try {
+      await tunnel.ensureReady();
+      return { tunnel, addedOwner };
+    } catch (error) {
+      if (addedOwner) this.releaseTiledTunnelOwner(tunnel, serverName);
+      throw error;
+    }
+  }
+
+  releaseTiledTunnelOwner(tunnel, serverName) {
+    tunnel.serverNames.delete(serverName);
+    if (tunnel.serverNames.size) return;
+    tunnel.close();
+    for (const [key, current] of this.tiledTunnels) {
+      if (current === tunnel) this.tiledTunnels.delete(key);
+    }
+  }
+
+  releaseTiledTunnels(serverName, except = null) {
+    for (const tunnel of this.tiledTunnels.values()) {
+      if (tunnel !== except && tunnel.serverNames.has(serverName)) this.releaseTiledTunnelOwner(tunnel, serverName);
+    }
+  }
+
+  closeTiledTunnels() {
+    for (const tunnel of this.tiledTunnels.values()) tunnel.close();
+    this.tiledTunnels.clear();
   }
 
   async ensureScreenDetached(serverName) {
@@ -708,16 +857,17 @@ class SSHOperations {
     }
     log.info(`${serverName}: Read launcher config file from ${localPath} (${Buffer.byteLength(content, 'utf8')} bytes)`);
 
+    const extension = path.extname(localPath);
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+
     if (isLocalHost(serverConfig.host)) {
       log.debug(`${serverName}: Using local config file ${localPath}`);
       return { success: true, configPath: localPath };
     }
 
-    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username);
-    const extension = path.extname(localPath);
-    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username, serverName);
     const remotePath = `${homePath}/.afl/configs/${safeServerName}.launch-config${extension}`;
-    const upload = await this.writeRemoteFile(serverConfig.host, remotePath, content);
+    const upload = await this.writeRemoteFile(serverConfig.host, remotePath, content, serverName);
     if (!upload.success) {
       const message = `Could not copy config file to ${serverConfig.host}: ${upload.error}`;
       log.error(`${serverName}: ${message}`);
@@ -726,6 +876,37 @@ class SSHOperations {
 
     log.info(`${serverName}: Copied local config file to ${remotePath}`);
     return { success: true, configPath: remotePath };
+  }
+
+  async resolveScriptPath(serverName, serverConfig) {
+    const localPath = serverConfig.script_file_location?.trim();
+    if (!localPath) return { success: true, scriptPath: serverConfig.server_script, localFile: false };
+    let content;
+    try {
+      content = await fs.readFile(localPath, 'utf8');
+    } catch (error) {
+      return { success: false, error: `Could not read script file on this computer ${localPath}: ${error.message}` };
+    }
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filename = `${safeServerName}.launch-script${path.extname(localPath) || '.sh'}`;
+    let scriptPath;
+    if (isLocalHost(serverConfig.host) && serverConfig.username === os.userInfo().username) {
+      scriptPath = path.join(path.dirname(this.aflGlobalConfigPath), 'scripts', filename);
+      try {
+        await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+        await fs.writeFile(scriptPath, content, { mode: 0o700 });
+        await fs.chmod(scriptPath, 0o700);
+      } catch (error) {
+        return { success: false, error: `Could not prepare launcher script: ${error.message}` };
+      }
+    } else {
+      const homePath = await this.getRemoteHomePath(serverConfig.host, serverConfig.username, serverName);
+      scriptPath = `${homePath}/.afl/scripts/${filename}`;
+      const copied = await this.writeRemoteFile(serverConfig.host, scriptPath, content, serverName, { mode: 0o700 });
+      if (!copied.success) return { success: false, error: `Could not copy launcher script to ${serverConfig.host}: ${copied.error}` };
+    }
+    log.info(`${serverName}: Prepared local script ${localPath} at ${scriptPath}`);
+    return { success: true, scriptPath, localFile: true, hasShebang: content.startsWith('#!') };
   }
 
   isDockerComposeManaged(serverConfig) {
@@ -845,12 +1026,32 @@ class SSHOperations {
     if (serverConfig.external_service) {
       return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
     }
+    let launchPort;
+    if ((serverConfig.server_type !== 'tiled' || isTiledProxy(serverConfig)) && serverConfig.httpPort != null) {
+      launchPort = Number(serverConfig.httpPort);
+      if (!Number.isInteger(launchPort) || launchPort < 1 || launchPort > 65535) {
+        return { success: false, error: 'HTTP port must be an integer between 1 and 65535.' };
+      }
+    }
 
     let launchConfigPath = null;
+    let scriptResult;
     if (serverConfig.server_module || serverConfig.server_type === 'tiled') {
       const configResult = await this.resolveModuleConfigPath(serverName, serverConfig);
       if (!configResult.success) return configResult;
       launchConfigPath = configResult.configPath;
+    }
+    const hasScript = !!(serverConfig.script_file_location || serverConfig.server_script);
+    if (!serverConfig.server_module && serverConfig.server_type !== 'tiled' && hasScript) {
+      scriptResult = await this.resolveScriptPath(serverName, serverConfig);
+      if (!scriptResult.success) return scriptResult;
+    }
+    if (serverConfig.server_type !== 'tiled' && (serverConfig.server_module || hasScript)) {
+      try {
+        await this.configureTiledForLaunch(serverName);
+      } catch (error) {
+        return { success: false, error: `Could not configure Tiled for ${serverName}: ${error.message}` };
+      }
     }
     
     // Detect remote OS to use appropriate screen options
@@ -877,20 +1078,19 @@ class SSHOperations {
 
     if (serverConfig.server_module) {
       let command = `python -m ${serverConfig.server_module}`;
+      if (launchPort !== undefined) {
+        command = `env AFL_HTTP_PORT=${shellQuote(launchPort)} ${command}`;
+      }
       if (launchConfigPath) {
         command += ` --config ${shellQuote(launchConfigPath)}`;
         log.info(`${serverName}: Launching server with provided config file ${launchConfigPath}`);
         log.debug(`${serverName}: Using config file ${launchConfigPath}`);
       }
       log.debug(`${serverName}: Using server_module: ${serverConfig.server_module}`);
-      
-      // Handle environment activation based on env_type
       if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
-        log.debug(`${serverName}: Activating virtualenv at ${serverConfig.virtualenv_path}`);
-        command = `source ${serverConfig.virtualenv_path}/bin/activate;${command}`;
+        command = `source ${shellQuote(path.posix.join(serverConfig.virtualenv_path, 'bin', 'activate'))} && ${command}`;
       } else if (serverConfig.conda_env) {
-        log.debug(`${serverName}: Activating conda env: ${serverConfig.conda_env}`);
-        command = `conda activate ${serverConfig.conda_env};${command}`;
+        command = `conda activate ${shellQuote(serverConfig.conda_env)} && ${command}`;
       }
       
       // On macOS, redirect output to log file since screen can't do it
@@ -903,31 +1103,41 @@ class SSHOperations {
       if (!launchConfigPath) {
         return { success: false, error: 'Tiled requires a config file location.' };
       }
-      // Tiled config files commonly use relative catalog/storage paths. Match
-      // tiled/start_tiled.sh by serving from the config file's directory.
       const tiledConfigDirectory = path.dirname(launchConfigPath);
-      let command = `cd ${shellQuote(tiledConfigDirectory)} && tiled serve config ${shellQuote(launchConfigPath)}`;
+      let command;
+      if (isTiledProxy(serverConfig)) {
+        command = `python -u -m AFL.automation.shared.TiledProxyDriver --config ${shellQuote(launchConfigPath)} --port ${shellQuote(launchPort)} --host ${shellQuote(isLocalHost(serverConfig.host) ? '127.0.0.1' : '0.0.0.0')}`;
+      } else {
+        // Native catalogs can have relative storage paths.
+        command = `cd ${shellQuote(tiledConfigDirectory)} && tiled serve config ${shellQuote(launchConfigPath)}`;
+      }
       // Keep the start path consistent with tiled/start_tiled.sh.
       if (serverConfig.env_type === 'pip' && serverConfig.virtualenv_path) {
-        command = `source ${shellQuote(path.join(serverConfig.virtualenv_path, 'bin', 'activate'))};${command}`;
+        command = `source ${shellQuote(path.join(serverConfig.virtualenv_path, 'bin', 'activate'))} && ${command}`;
       } else {
-        command = `conda activate ${shellQuote(serverConfig.conda_env || 'afl_agent')};${command}`;
+        command = `conda activate ${shellQuote(serverConfig.conda_env || 'afl_agent')} && ${command}`;
       }
       if (isMacOs) {
         command = `${command} >> $\{HOME}/${screenLogPath} 2>&1`;
       }
       startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell || 'bash'} -ci ${shellQuote(command)}`;
-    } else if (serverConfig.server_script) {
-      log.debug(`${serverName}: Using server_script: ${serverConfig.server_script}`);
+    } else if (hasScript) {
+      let scriptCommand = scriptResult.localFile
+        ? (scriptResult.hasShebang ? shellQuote(scriptResult.scriptPath) : `${shellQuote(serverConfig.shell || 'bash')} ${shellQuote(scriptResult.scriptPath)}`)
+        : serverConfig.server_script;
+      if (launchPort !== undefined) {
+        scriptCommand = `env AFL_HTTP_PORT=${shellQuote(launchPort)} ${scriptCommand}`;
+      }
+      log.debug(`${serverName}: Using script: ${scriptResult.scriptPath}`);
       if (isMacOs) {
         // Wrap script to redirect output on macOS
-        startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.shell} -c "${serverConfig.server_script} >> $\{HOME}/${screenLogPath} 2>&1"`;
+        startCommand = `screen -d -m ${screenLogOpts} -S ${shellQuote(serverConfig.screen_name)} ${serverConfig.shell || 'bash'} -c ${shellQuote(`${scriptCommand} >> "$\{HOME}/${screenLogPath}" 2>&1`)}`;
       } else {
-        startCommand = `screen -d -m ${screenLogOpts} -S ${serverConfig.screen_name} ${serverConfig.server_script}`;
+        startCommand = `screen -d -m ${screenLogOpts} -S ${shellQuote(serverConfig.screen_name)} ${scriptCommand}`;
       }
     } else {
-      log.error(`${serverName}: Neither server_module nor server_script specified`);
-      return { success: false, error: 'Neither server_module nor server_script specified in config' };
+      log.error(`${serverName}: No server module or script specified`);
+      return { success: false, error: 'No server_module, script_file_location, or server_script specified in config' };
     }
 
     let launchContext;
@@ -1051,6 +1261,7 @@ class SSHOperations {
       // A NAS-hosted Tiled service is shared infrastructure. Stop means
       // disconnect this Andon session; it must not stop or alter the remote
       // Docker Compose service.
+      if (this.activeTiledServerName === serverName) this.activeTiledServerName = null;
       return {
         success: true,
         disconnected: true,
@@ -1103,6 +1314,8 @@ class SSHOperations {
     const result = await this.executeCommand(serverName, stopCommand);
     
     if (result.success) {
+      if (this.activeTiledServerName === serverName) this.activeTiledServerName = null;
+      this.releaseTiledTunnels(serverName);
       log.info(`${serverName}: Server stopped successfully`);
       const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
       if (!runtimeConfig.success) {
@@ -1167,7 +1380,7 @@ class SSHOperations {
       return { success: false, error: 'Server not found' };
     }
     if (this.isDockerComposeManaged(serverConfig)) {
-      if (serverConfig.tiled_management.authentication === 'password' && !this.hasSessionPassword(serverName)) {
+      if (getSshAuthentication(serverConfig) === 'password' && !this.hasSessionPassword(serverName)) {
         return {
           success: false,
           status: false,
@@ -1203,7 +1416,8 @@ class SSHOperations {
     
     // Use the cached screen sessions if they exist for this host and are recent
     const host = serverConfig.host;
-    const cachedData = this.screenSessionCache && this.screenSessionCache[host];
+    const credentialId = this.getCredentialId(serverName);
+    const cachedData = this.screenSessionCache && this.screenSessionCache[credentialId];
     const now = Date.now();
     
     if (cachedData && (now - cachedData.timestamp) < 5000) { // Cache valid for 5 seconds
@@ -1222,7 +1436,12 @@ class SSHOperations {
 
     if (!result.success) {
       log.debug(`${serverName}: Failed to get status - SSH down`);
-      return { success: false, sshDown: true };
+      return {
+        success: false,
+        sshDown: !!result.sshDown,
+        authenticationRequired: !!result.authenticationRequired,
+        error: result.error
+      };
     }
     
     // Parse and cache all screen sessions for this host
@@ -1237,7 +1456,7 @@ class SSHOperations {
     const matchingSession = sessionDetails.find(session => session.name === serverConfig.screen_name);
     
     // Cache the results
-    this.screenSessionCache[host] = {
+    this.screenSessionCache[credentialId] = {
       timestamp: now,
       sessions: screenSessions,
       sessionDetails
@@ -1256,13 +1475,9 @@ class SSHOperations {
   }
 
   // Get status for all servers on a given host in one call
-  async getBatchServerStatus(host) {
-    // Find a server from this host to execute the command
-    const serverName = Object.keys(this.config).find(name =>
-      this.config[name].host === host
-    );
+  async getBatchServerStatus(host, serverName = this.getServerNameForHost(host)) {
     
-    if (!serverName) {
+    if (!serverName || this.config[serverName]?.host !== host) {
       log.error(`No server configured for host ${host}`);
       return { success: false, error: `No server configured for host ${host}` };
     }
@@ -1273,7 +1488,13 @@ class SSHOperations {
     
     if (!result.success) {
       log.debug(`Batch status check failed for host ${host} - SSH down`);
-      return { success: false, sshDown: true, host };
+      return {
+        success: false,
+        sshDown: !!result.sshDown,
+        authenticationRequired: !!result.authenticationRequired,
+        error: result.error,
+        host
+      };
     }
     
     const sessionDetails = parseScreenSessions(result.output);
@@ -1286,7 +1507,7 @@ class SSHOperations {
     if (!this.screenSessionCache) {
       this.screenSessionCache = {};
     }
-    this.screenSessionCache[host] = {
+    this.screenSessionCache[this.getCredentialId(serverName)] = {
       timestamp: now,
       sessions: screenSessions,
       sessionDetails
@@ -1485,10 +1706,9 @@ class SSHOperations {
     return entry ? entry[0] : null;
   }
 
-  async readRemoteFile(host, remotePath) {
-    const server = this.getServerForHost(host);
-    const serverName = this.getServerNameForHost(host);
-    if (!server) {
+  async readRemoteFile(host, remotePath, serverName = this.getServerNameForHost(host)) {
+    const server = this.config[serverName];
+    if (!server || server.host !== host) {
       log.error(`Cannot read remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
@@ -1526,10 +1746,9 @@ class SSHOperations {
     });
   }
 
-  async writeRemoteFile(host, remotePath, content) {
-    const server = this.getServerForHost(host);
-    const serverName = this.getServerNameForHost(host);
-    if (!server) {
+  async writeRemoteFile(host, remotePath, content, serverName = this.getServerNameForHost(host), options = {}) {
+    const server = this.config[serverName];
+    if (!server || server.host !== host) {
       log.error(`Cannot write remote file: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
@@ -1555,10 +1774,39 @@ class SSHOperations {
         }
         const dir = path.posix.dirname(remotePath);
         const parentDir = path.posix.dirname(dir);
+        const writePath = options.atomic ? `${remotePath}.tmp-${process.pid}-${Date.now()}` : remotePath;
         log.debug(`Creating directories ${parentDir} and ${dir} on ${host}`);
         sftp.mkdir(parentDir, { mode: 0o755 }, () => {
           sftp.mkdir(dir, { mode: 0o755 }, () => {
-            sftp.writeFile(remotePath, content, 'utf8', (err2) => {
+            const writeOptions = options.mode === undefined ? 'utf8' : { encoding: 'utf8', mode: options.mode };
+            sftp.writeFile(writePath, content, writeOptions, (err2) => {
+              if (!err2 && options.mode !== undefined) {
+                // writeFile's mode only applies to new files. Restrict an
+                // existing global file as well before closing the connection.
+                sftp.chmod(writePath, options.mode, commit);
+              } else {
+                commit(err2);
+              }
+            });
+            function commit(error) {
+              if (error || !options.atomic) return finish(error);
+              // OpenSSH's extension replaces an existing destination
+              // atomically; ordinary SFTP rename does not on every server.
+              const rename = sftp.ext_openssh_rename || sftp.rename;
+              try {
+                rename.call(sftp, writePath, remotePath, finish);
+              } catch (error) {
+                finish(error);
+              }
+            }
+            function finish(err2) {
+              if (err2 && options.atomic) {
+                sftp.unlink(writePath, () => {
+                  conn.end();
+                  resolve({ success: false, error: err2.message });
+                });
+                return;
+              }
               conn.end();
               if (err2) {
                 log.error(`Failed to write ${remotePath} on ${host}:`, err2.message);
@@ -1567,25 +1815,25 @@ class SSHOperations {
                 log.info(`Successfully wrote ${remotePath} to ${host} (${content.length} bytes)`);
                 resolve({ success: true });
               }
-              });
+            }
           });
         });
       });
     });
   }
 
-  async getRemoteAflConfig(host) {
-    const server = this.getServerForHost(host);
-    if (!server) {
+  async getRemoteAflConfig(host, serverName = this.getServerNameForHost(host)) {
+    const server = this.config[serverName];
+    if (!server || server.host !== host) {
       log.error(`Cannot get Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
-    const homePath = await this.getRemoteHomePath(host, server.username);
+    const homePath = await this.getRemoteHomePath(host, server.username, serverName);
     const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
     log.info(`Getting Andon config from ${host}: ${remotePath}`);
     
-    const res = await this.readRemoteFile(host, remotePath);
+    const res = await this.readRemoteFile(host, remotePath, serverName);
     if (!res.success) {
       if (/no such file|enoent/i.test(res.error || '')) {
         log.info(`No Andon config exists yet on ${host}`);
@@ -1605,21 +1853,21 @@ class SSHOperations {
     }
   }
 
-  async saveRemoteAflConfig(host, cfgObj) {
-    const server = this.getServerForHost(host);
-    if (!server) {
+  async saveRemoteAflConfig(host, cfgObj, serverName = this.getServerNameForHost(host)) {
+    const server = this.config[serverName];
+    if (!server || server.host !== host) {
       log.error(`Cannot save Andon config: no server for host ${host}`);
       return { success: false, error: `No server for host ${host}` };
     }
     
-    const homePath = await this.getRemoteHomePath(host, server.username);
+    const homePath = await this.getRemoteHomePath(host, server.username, serverName);
     const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
     log.info(`Saving Andon config to ${remotePath} on ${host}`);
     
     const { driver_custom_configs, ...andonConfig } = cfgObj || {};
     const content = JSON.stringify(andonConfig, null, 2);
     
-    const res = await this.writeRemoteFile(host, remotePath, content);
+    const res = await this.writeRemoteFile(host, remotePath, content, serverName);
     if (res.success) {
       log.info(`Andon config saved successfully on ${host}`);
     }
@@ -1631,7 +1879,7 @@ class SSHOperations {
     if (!serverConfig) return { success: false, error: 'Server not found' };
 
     const host = serverConfig.host;
-    const current = await this.getRemoteAflConfig(host);
+    const current = await this.getRemoteAflConfig(host, serverName);
     if (!current.success) return current;
 
     const { driver_custom_configs, ...andonConfig } = current.data || {};
@@ -1646,7 +1894,7 @@ class SSHOperations {
     };
     andonConfig.launchers = launchers;
 
-    return this.saveRemoteAflConfig(host, andonConfig);
+    return this.saveRemoteAflConfig(host, andonConfig, serverName);
   }
 }
 

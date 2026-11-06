@@ -103,3 +103,13 @@ management:
     /management.username is required/
   );
 });
+
+test('a URI client profile launches a local AFL proxy while keeping the upstream URL', async () => {
+  const profile = await loadTiledProfile('/profiles/http.yml', {
+    readFile: async () => 'uri: http://tiled.example:8000\napi_key: test-key\n'
+  });
+  assert.equal(profile.mode, 'proxy');
+  assert.equal(profile.management.type, 'afl_proxy');
+  assert.equal(profile.uri, 'http://tiled.example:8000/');
+  assert.equal(profile.apiKey, 'test-key');
+});

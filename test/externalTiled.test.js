@@ -5,6 +5,39 @@ const path = require('node:path');
 const test = require('node:test');
 
 const SSHOperations = require('../sshOperations');
+const { getSshAuthentication } = require('../sshAuthentication');
+
+test('a NAS card uses password authentication after loading a YAML without an SSH mode', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'andon-tiled-auth-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const profilePath = path.join(directory, 'nas.yaml');
+  const configPath = path.join(directory, 'launchers.json');
+  await fs.writeFile(profilePath, `
+uvicorn:
+  port: 8000
+management:
+  type: docker_compose
+  host: 192.0.2.10
+  username: nas-user
+  project_directory: /srv/tiled-project
+  service: tiled
+`);
+  await fs.writeFile(configPath, JSON.stringify({
+    nas: { server_type: 'tiled', config_file_location: profilePath, ssh_authentication: 'password' }
+  }));
+  const operations = new SSHOperations(configPath);
+  await operations.loadConfig();
+  assert.equal(getSshAuthentication(operations.config.nas), 'password');
+  assert.equal((await operations.getServerStatus('nas')).authenticationRequired, true);
+  operations.setSessionPassword('nas', 'session-secret');
+  operations.connectWithPassword = async (_name, server, password) => {
+    assert.equal(server.host, '192.0.2.10');
+    assert.equal(server.username, 'nas-user');
+    assert.equal(password, 'session-secret');
+    return { connected: true };
+  };
+  assert.equal((await operations.connectWithAvailableKeys('nas')).authentication, 'password');
+});
 
 test('a Docker Compose Tiled profile disconnects without stopping the service', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'andon-external-tiled-'));
@@ -24,7 +57,7 @@ management:
   service: tiled
 `);
   await fs.writeFile(configPath, JSON.stringify({
-    aflnas_tiled: {
+    nas_tiled: {
       server_type: 'tiled',
       config_file_location: profilePath,
       host: 'localhost',
@@ -39,7 +72,7 @@ management:
     aflGlobalConfigPath: path.join(directory, 'afl-global-config.json')
   });
   await operations.loadConfig();
-  const server = operations.config.aflnas_tiled;
+  const server = operations.config.nas_tiled;
 
   assert.equal(server.external_service, true);
   assert.equal(server.host, '192.0.2.10');
@@ -61,30 +94,30 @@ management:
   };
   operations.waitForServerHealth = async () => ({ ok: true, statusCode: 200 });
 
-  assert.deepEqual(await operations.getServerStatus('aflnas_tiled'), {
+  assert.deepEqual(await operations.getServerStatus('nas_tiled'), {
     success: false,
     status: false,
     authenticationRequired: true,
     managementType: 'docker_compose',
     screenState: 'unknown'
   });
-  operations.setSessionPassword('aflnas_tiled', 'test-password');
+  operations.setSessionPassword('nas_tiled', 'test-password');
 
-  assert.deepEqual(await operations.getServerStatus('aflnas_tiled'), {
+  assert.deepEqual(await operations.getServerStatus('nas_tiled'), {
     success: true,
     status: true,
     managementType: 'docker_compose',
     screenState: 'running'
   });
-  assert.equal((await operations.startServer('aflnas_tiled')).success, true);
+  assert.equal((await operations.startServer('nas_tiled')).success, true);
   const aflGlobalConfig = JSON.parse(await fs.readFile(path.join(directory, 'afl-global-config.json'), 'utf8'));
   assert.deepEqual(Object.values(aflGlobalConfig).at(-1), {
     tiled_server: 'http://192.0.2.10:8000',
     tiled_api_key: 'test-secret'
   });
   const commandCountBeforeStop = commands.length;
-  operations.clearSessionPassword('aflnas_tiled');
-  assert.deepEqual(await operations.stopServer('aflnas_tiled'), {
+  operations.clearSessionPassword('nas_tiled');
+  assert.deepEqual(await operations.stopServer('nas_tiled'), {
     success: true,
     disconnected: true,
     status: false,
@@ -92,10 +125,10 @@ management:
     screenState: 'disconnected'
   });
   assert.equal(commands.length, commandCountBeforeStop);
-  operations.setSessionPassword('aflnas_tiled', 'test-password');
-  assert.equal((await operations.restartServer('aflnas_tiled')).success, true);
-  assert.equal((await operations.getServerLog('aflnas_tiled')).success, true);
-  assert.equal((await operations.joinServer('aflnas_tiled')).success, true);
+  operations.setSessionPassword('nas_tiled', 'test-password');
+  assert.equal((await operations.restartServer('nas_tiled')).success, true);
+  assert.equal((await operations.getServerLog('nas_tiled')).success, true);
+  assert.equal((await operations.joinServer('nas_tiled')).success, true);
   assert.equal(commands.length, 5);
   assert.ok(commands.every(command => command.startsWith("sudo -S -p '")));
   assert.match(commands[0], /docker compose ps --status running --quiet/);
@@ -110,10 +143,10 @@ management:
 
   await fs.writeFile(profilePath, 'uvicorn:\n  port: 8000\ntrees:\n  - path: /\n    tree: catalog\n');
   await operations.loadConfig();
-  assert.equal(operations.config.aflnas_tiled.external_service, false);
-  assert.deepEqual(operations.config.aflnas_tiled.tiled_management, { type: 'screen' });
-  assert.equal(operations.config.aflnas_tiled.tiled_profile_uri, undefined);
-  assert.deepEqual(operations.getServersByHost(), { localhost: ['aflnas_tiled'] });
+  assert.equal(operations.config.nas_tiled.external_service, false);
+  assert.deepEqual(operations.config.nas_tiled.tiled_management, { type: 'screen' });
+  assert.equal(operations.config.nas_tiled.tiled_profile_uri, undefined);
+  assert.deepEqual(operations.getServersByHost(), { localhost: ['nas_tiled'] });
 });
 
 test('Docker Compose start validates the project and skips an already-running service', async () => {
@@ -126,7 +159,7 @@ test('Docker Compose start validates the project and skips an already-running se
       tiled_management: {
         type: 'docker_compose',
         authentication: 'password',
-        projectDirectory: '/volume1/docker/tiled',
+        projectDirectory: '/srv/tiled-project',
         service: 'tiled'
       }
     }
@@ -156,7 +189,7 @@ test('Docker Compose start reports a missing project instead of launching', asyn
       tiled_management: {
         type: 'docker_compose',
         authentication: 'password',
-        projectDirectory: '/volume1/docker/tiled',
+        projectDirectory: '/srv/tiled-project',
         service: 'tiled'
       }
     }
