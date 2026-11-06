@@ -8,8 +8,13 @@ const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
 const SSHOperations = require('./sshOperations');
+const { getSshAuthentication } = require('./sshAuthentication');
 const { isExpectedWebviewNavigationAbort } = require('./electronErrors');
 const { loadTiledProfile } = require('./tiled/profile');
+const { registerTerminationHandlers, signalExitCodes } = require('./termination');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { errorText, inferErrorServers, ipcErrorServers, ServerLogErrors } = require('./errorReporting');
+const { decodeLogChunk, stripTerminalControl } = require('./allLogs');
 
 let mainWindow;
 let sshOps;
@@ -27,6 +32,9 @@ let closeConfirmationInProgress = false;
 let allowWindowClose = false;
 const tiledCatalogPathCache = new Map();
 const andonConfigPath = path.join(os.homedir(), '.afl', 'configs', 'andon.config.json');
+const ipcErrorContext = new AsyncLocalStorage();
+const pollingErrorSignatures = new Map();
+const serverLogErrors = new ServerLogErrors((serverName, error) => reportApplicationError([serverName], error));
 
 const ICON_PATH_MAC = path.join(__dirname, 'assets', 'icons', 'mac', 'icon.icns');
 const ICON_PATH_PNG = path.join(__dirname, 'assets', 'icons', 'png', '256x256.png');
@@ -44,10 +52,65 @@ function sendSessionLogEvent(entry, payload) {
   }
 }
 
+function reportApplicationError(serverNames, error, observedAt = Date.now()) {
+  const text = errorText(error);
+  const context = ipcErrorContext.getStore();
+  context?.reported.push(text);
+  if (context?.pollingKey) {
+    let reported = pollingErrorSignatures.get(context.pollingKey);
+    if (!reported) pollingErrorSignatures.set(context.pollingKey, reported = new Set());
+    if (reported.has(text)) return;
+    reported.add(text);
+  }
+  for (const serverName of serverNames) {
+    sendSessionLogEvent({ serverName, owner: mainWindow?.webContents }, {
+      type: 'error', error: text, observedAt
+    });
+  }
+}
+
+// One boundary covers failed IPC results and rejected calls, including calls
+// from the bundled Tiled browser. Async context keeps concurrent servers apart.
+function handleIpc(channel, handler) {
+  ipcMain.handle(channel, (event, ...args) => {
+    const serverNames = ipcErrorServers(channel, args, sshOps?.config);
+    const pollingKey = ['get-server-status', 'get-batch-server-status', 'tiled-ping'].includes(channel)
+      ? JSON.stringify([channel, serverNames]) : null;
+    const context = { serverNames, pollingKey, reported: [] };
+    return ipcErrorContext.run(context, async () => {
+      try {
+        const result = await handler(event, ...args);
+        if (!result?.canceled && (result?.success === false || result?.ok === false || result?.degraded)) {
+          const message = result.error || result.reason || result.warning || result.message ||
+            (result.sshDown ? 'SSH connection failed.' : 'Operation failed.');
+          if (!context.reported.some(text => text.includes(errorText(message)))) {
+            reportApplicationError(serverNames, message);
+          }
+          if (result.output && !context.reported.some(text => text.includes(result.output))) {
+            reportApplicationError(serverNames, result.output);
+          }
+        } else if (pollingKey && (result?.success === true || result?.ok === true)) {
+          pollingErrorSignatures.delete(pollingKey);
+        }
+        return result;
+      } catch (error) {
+        reportApplicationError(serverNames, error);
+        throw error;
+      }
+    });
+  });
+}
+
 setLogSink(({ level, moduleName, text, observedAt }) => {
   // Polling details remain available in afl-andon.log at debug level. The
   // combined log keeps operational messages and explicit status transitions.
   if (!['error', 'warn', 'info'].includes(level)) return;
+  if (level === 'error') {
+    const context = ipcErrorContext.getStore();
+    const servers = context && context.serverNames[0] !== 'Andon'
+      ? context.serverNames : inferErrorServers(text, sshOps?.config);
+    reportApplicationError(servers, text, observedAt);
+  }
   const lines = String(text).split(/\r?\n/);
   const entries = lines.map(line => ({
     server: 'Andon',
@@ -85,6 +148,9 @@ async function openSessionLogStream(entry) {
     const controller = await sshOps.streamServerLog(entry.serverName, entry.startOffset, {
       onData(data) {
         if (!entry.desired || generation !== entry.generation) return;
+        const decoded = decodeLogChunk(entry.errorRemainder, stripTerminalControl(data));
+        entry.errorRemainder = decoded.remainder;
+        serverLogErrors.consume(entry.serverName, decoded.lines);
         if (!entry.receivedData) {
           entry.receivedData = true;
           log.info(`Receiving session log stream for ${entry.serverName}`);
@@ -148,6 +214,7 @@ async function openSessionLogStream(entry) {
 
 async function beginSessionLogStream(serverName, owner, startOffset) {
   stopSessionLogStream(serverName, false);
+  serverLogErrors.reset(serverName);
   const entry = {
     serverName,
     owner,
@@ -161,6 +228,7 @@ async function beginSessionLogStream(serverName, owner, startOffset) {
     pendingSize: 0,
     lastStatus: 'connecting',
     error: '',
+    errorRemainder: '',
     startOffset,
     receivedData: false
   };
@@ -188,6 +256,8 @@ function activateSessionLogStream(serverName, owner) {
 function stopSessionLogStream(serverName, notify = true) {
   const entry = sessionLogStreams.get(serverName);
   if (!entry) return;
+  if (entry.errorRemainder) serverLogErrors.consume(serverName, [entry.errorRemainder]);
+  serverLogErrors.flush(serverName);
   entry.desired = false;
   entry.generation += 1;
   clearTimeout(entry.reconnectTimer);
@@ -224,7 +294,7 @@ async function getTiledBaseUrl(serverName) {
   if (!server) throw new Error('The Tiled launcher is not configured.');
 
   const profile = await getTiledLauncherProfile(serverName, { loadApiKey: false });
-  const rawUrl = profile?.uri || server.webview_url || `http://${server.host}:${server.httpPort}/`;
+  const rawUrl = (profile?.mode !== 'proxy' && profile?.uri) || server.webview_url || `http://${server.host}:${server.httpPort}/`;
   let baseUrl;
   try {
     baseUrl = new URL(rawUrl);
@@ -468,6 +538,7 @@ async function tiledPing(serverName) {
   const baseUrl = await getTiledBaseUrl(serverName);
   const url = new URL('api/v1/metadata/', baseUrl);
   const response = await fetch(url, { headers: await getTiledRequestHeaders(serverName) });
+  await response.body?.cancel();
   if (!response.ok) {
     return { ok: false, statusCode: response.status, reason: `HTTP ${response.status}`, url: url.toString() };
   }
@@ -565,6 +636,7 @@ async function stopManagedServersForShutdown() {
         }
       });
       stopAllSessionLogStreams();
+      sshOps.closeTiledTunnels();
     }
     await combinedLogWriter.flush();
   })().finally(() => {
@@ -623,7 +695,7 @@ app.on('before-quit', (event) => {
 async function handleTerminationSignal(signal) {
   log.info(`Received ${signal}; stopping Andon-started servers before exit`);
   await stopManagedServersForShutdown();
-  process.exitCode = signal === 'SIGINT' ? 130 : signal === 'SIGQUIT' ? 131 : 143;
+  process.exitCode = signalExitCodes[signal];
   app.exit(process.exitCode);
 }
 
@@ -639,31 +711,10 @@ async function handleFatalError(kind, error) {
   app.exit(1);
 }
 
-process.once('SIGINT', () => {
-  handleTerminationSignal('SIGINT').catch(error => {
-    log.error(`SIGINT shutdown failed: ${error.message}`);
-    app.exit(130);
-  });
-});
-
-process.once('SIGTERM', () => {
-  handleTerminationSignal('SIGTERM').catch(error => {
-    log.error(`SIGTERM shutdown failed: ${error.message}`);
-    app.exit(143);
-  });
-});
-
-process.once('SIGHUP', () => {
-  handleTerminationSignal('SIGHUP').catch(error => {
-    log.error(`SIGHUP shutdown failed: ${error.message}`);
-    app.exit(143);
-  });
-});
-
-process.once('SIGQUIT', () => {
-  handleTerminationSignal('SIGQUIT').catch(error => {
-    log.error(`SIGQUIT shutdown failed: ${error.message}`);
-    app.exit(131);
+registerTerminationHandlers(signal => {
+  handleTerminationSignal(signal).catch(error => {
+    log.error(`${signal} shutdown failed: ${error.message}`);
+    app.exit(signalExitCodes[signal]);
   });
 });
 
@@ -690,7 +741,7 @@ app.on('activate', () => {
   }
 });
 
-ipcMain.handle('start-server', async (event, serverName) => {
+handleIpc('start-server', async (event, serverName) => {
   log.info(`IPC: start-server requested for ${serverName}`);
   // Register before invoking the launcher: startServer can create a screen
   // and bind a port before a later health/detach check returns failure.
@@ -704,7 +755,7 @@ ipcMain.handle('start-server', async (event, serverName) => {
     if (result.sshDown) {
       stopSessionLogStream(serverName, false);
       log.warn(`start-server: SSH is down for ${serverName}`);
-      return { success: false, sshDown: true };
+      return result;
     }
     if (!result.success) {
       stopSessionLogStream(serverName, false);
@@ -724,13 +775,13 @@ ipcMain.handle('start-server', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('has-session-ssh-password', (_event, serverName) => {
+handleIpc('has-session-ssh-password', (_event, serverName) => {
   return { available: sshOps.hasSessionPassword(serverName) };
 });
 
-ipcMain.handle('set-session-ssh-password', (_event, serverName, password) => {
+handleIpc('set-session-ssh-password', (_event, serverName, password) => {
   const server = sshOps.config[serverName];
-  if (server?.tiled_management?.authentication !== 'password') {
+  if (getSshAuthentication(server) !== 'password') {
     return { success: false, error: 'This launcher does not use password authentication.' };
   }
   try {
@@ -741,13 +792,13 @@ ipcMain.handle('set-session-ssh-password', (_event, serverName, password) => {
   }
 });
 
-ipcMain.handle('stop-server', async (event, serverName) => {
+handleIpc('stop-server', async (event, serverName) => {
   log.info(`IPC: stop-server requested for ${serverName}`);
   try {
     const result = await sshOps.stopServer(serverName);
     if (result.sshDown) {
       log.warn(`stop-server: SSH is down for ${serverName}`);
-      return { success: false, sshDown: true };
+      return result;
     }
     if (result.success) {
       andonManagedServers.delete(serverName);
@@ -764,7 +815,7 @@ ipcMain.handle('stop-server', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('restart-server', async (event, serverName) => {
+handleIpc('restart-server', async (event, serverName) => {
   log.info(`IPC: restart-server requested for ${serverName}`);
   andonManagedServers.add(serverName);
   try {
@@ -776,7 +827,7 @@ ipcMain.handle('restart-server', async (event, serverName) => {
     if (result.sshDown) {
       stopSessionLogStream(serverName, false);
       log.warn(`restart-server: SSH is down for ${serverName}`);
-      return { success: false, sshDown: true };
+      return result;
     }
     if (!result.success) {
       stopSessionLogStream(serverName, false);
@@ -792,11 +843,11 @@ ipcMain.handle('restart-server', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('activate-server-log-stream', (event, serverName) => {
+handleIpc('activate-server-log-stream', (event, serverName) => {
   return activateSessionLogStream(serverName, event.sender);
 });
 
-ipcMain.handle('get-session-log-events', (_event, afterSequence = 0) => {
+handleIpc('get-session-log-events', (_event, afterSequence = 0) => {
   const cursor = Number.isSafeInteger(afterSequence) && afterSequence >= 0 ? afterSequence : 0;
   return {
     events: sessionLogEvents.filter(item => item.sequence > cursor),
@@ -810,7 +861,7 @@ ipcMain.on('append-combined-log-entries', (_event, entries) => {
   });
 });
 
-ipcMain.handle('get-server-status', async (event, serverName) => {
+handleIpc('get-server-status', async (event, serverName) => {
   log.debug(`IPC: get-server-status for ${serverName}`);
   try {
     const result = await sshOps.getServerStatus(serverName);
@@ -822,10 +873,10 @@ ipcMain.handle('get-server-status', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('get-batch-server-status', async (event, host) => {
+handleIpc('get-batch-server-status', async (event, host, serverName) => {
   log.debug(`IPC: get-batch-server-status for host ${host}`);
   try {
-    const result = await sshOps.getBatchServerStatus(host);
+    const result = await sshOps.getBatchServerStatus(host, serverName);
     if (result.success) {
       log.debug(`get-batch-server-status: ${host} sessions=${result.sessions?.length || 0}`);
     } else {
@@ -838,20 +889,20 @@ ipcMain.handle('get-batch-server-status', async (event, host) => {
   }
 });
 
-ipcMain.handle('get-servers-by-host', (event) => {
+handleIpc('get-servers-by-host', (event) => {
   log.debug('IPC: get-servers-by-host');
   const result = sshOps.getServersByHost();
   log.debug(`get-servers-by-host: ${Object.keys(result).length} hosts found`);
   return result;
 });
 
-ipcMain.handle('get-server-log', async (event, serverName) => {
+handleIpc('get-server-log', async (event, serverName) => {
   log.info(`IPC: get-server-log for ${serverName}`);
   try {
     const result = await sshOps.getServerLog(serverName);
     if (result.sshDown) {
       log.warn(`get-server-log: SSH is down for ${serverName}`);
-      return { success: false, sshDown: true };
+      return result;
     }
     log.debug(`get-server-log: Retrieved ${result.output?.length || 0} bytes for ${serverName}`);
     return result;
@@ -861,13 +912,13 @@ ipcMain.handle('get-server-log', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('join-server', async (event, serverName) => {
+handleIpc('join-server', async (event, serverName) => {
   log.info(`IPC: join-server for ${serverName}`);
   try {
     const result = await sshOps.joinServer(serverName);
     if (result.sshDown) {
       log.warn(`join-server: SSH is down for ${serverName}`);
-      return { success: false, sshDown: true };
+      return result;
     }
     return result;
   } catch (error) {
@@ -876,7 +927,7 @@ ipcMain.handle('join-server', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('import-config', async () => {
+handleIpc('import-config', async () => {
   log.info('IPC: import-config');
   try {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -886,7 +937,7 @@ ipcMain.handle('import-config', async () => {
 
     if (result.canceled) {
       log.debug('import-config: Dialog canceled');
-      return { success: false, message: 'File selection was canceled.' };
+      return { success: false, canceled: true, message: 'File selection was canceled.' };
     }
 
     const sourcePath = result.filePaths[0];
@@ -901,7 +952,7 @@ ipcMain.handle('import-config', async () => {
   }
 });
 
-ipcMain.handle('import-ssh-key', async () => {
+handleIpc('import-ssh-key', async () => {
   log.info('IPC: import-ssh-key');
   try {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -910,7 +961,7 @@ ipcMain.handle('import-ssh-key', async () => {
 
     if (result.canceled) {
       log.debug('import-ssh-key: Dialog canceled');
-      return { success: false, message: 'File selection was canceled.' };
+      return { success: false, canceled: true, message: 'File selection was canceled.' };
     }
 
     const sourcePath = result.filePaths[0];
@@ -926,7 +977,7 @@ ipcMain.handle('import-ssh-key', async () => {
   }
 });
 
-ipcMain.handle('get-config', async () => {
+handleIpc('get-config', async () => {
   log.debug('IPC: get-config');
   await sshOps.loadConfig();  // Reload config before sending
   const serverCount = Object.keys(sshOps.config).filter(name => name !== 'configs_locations').length;
@@ -958,7 +1009,7 @@ ipcMain.handle('get-config-location-options', async () => {
 // These endpoints are intentionally restricted to a Tiled-type launcher (with
 // a legacy fallback for a launcher named "tiled"). The bundled browser uses them so it can read the Tiled catalog
 // without depending on an AFL driver or on browser CORS configuration.
-ipcMain.handle('tiled-ping', async (_event, serverName) => {
+handleIpc('tiled-ping', async (_event, serverName) => {
   try {
     return await tiledPing(serverName);
   } catch (error) {
@@ -967,7 +1018,7 @@ ipcMain.handle('tiled-ping', async (_event, serverName) => {
   }
 });
 
-ipcMain.handle('tiled-search', async (_event, serverName, options) => {
+handleIpc('tiled-search', async (_event, serverName, options) => {
   try {
     return { success: true, data: await tiledSearch(serverName, options) };
   } catch (error) {
@@ -976,7 +1027,7 @@ ipcMain.handle('tiled-search', async (_event, serverName, options) => {
   }
 });
 
-ipcMain.handle('tiled-metadata', async (_event, serverName, entryId) => {
+handleIpc('tiled-metadata', async (_event, serverName, entryId) => {
   try {
     return { success: true, data: await tiledMetadata(serverName, entryId) };
   } catch (error) {
@@ -985,7 +1036,7 @@ ipcMain.handle('tiled-metadata', async (_event, serverName, entryId) => {
   }
 });
 
-ipcMain.handle('tiled-full-data', async (_event, serverName, entryId) => {
+handleIpc('tiled-full-data', async (_event, serverName, entryId) => {
   try {
     return { success: true, data: await tiledFullData(serverName, entryId) };
   } catch (error) {
@@ -994,7 +1045,7 @@ ipcMain.handle('tiled-full-data', async (_event, serverName, entryId) => {
   }
 });
 
-ipcMain.handle('tiled-data-preview', async (_event, serverName, entryId) => {
+handleIpc('tiled-data-preview', async (_event, serverName, entryId) => {
   try {
     return { success: true, data: await tiledDataPreview(serverName, entryId) };
   } catch (error) {
@@ -1003,7 +1054,7 @@ ipcMain.handle('tiled-data-preview', async (_event, serverName, entryId) => {
   }
 });
 
-ipcMain.handle('tiled-container-data', async (_event, serverName, entryId) => {
+handleIpc('tiled-container-data', async (_event, serverName, entryId) => {
   try {
     return { success: true, data: await tiledContainerData(serverName, entryId) };
   } catch (error) {
@@ -1012,7 +1063,7 @@ ipcMain.handle('tiled-container-data', async (_event, serverName, entryId) => {
   }
 });
 
-ipcMain.handle('tiled-container-structure', async (_event, serverName, entryId) => {
+handleIpc('tiled-container-structure', async (_event, serverName, entryId) => {
   try {
     return { success: true, data: await tiledContainerStructure(serverName, entryId) };
   } catch (error) {
@@ -1021,7 +1072,7 @@ ipcMain.handle('tiled-container-structure', async (_event, serverName, entryId) 
   }
 });
 
-ipcMain.handle('tiled-distinct', async (_event, serverName, field, filters) => {
+handleIpc('tiled-distinct', async (_event, serverName, field, filters) => {
   try {
     return { success: true, data: await tiledDistinct(serverName, field, filters) };
   } catch (error) {
@@ -1030,7 +1081,7 @@ ipcMain.handle('tiled-distinct', async (_event, serverName, field, filters) => {
   }
 });
 
-ipcMain.handle('tiled-open-plot', async (event, serverName, entryIds) => {
+handleIpc('tiled-open-plot', async (event, serverName, entryIds) => {
   try {
     if (!isTiledLauncher(serverName)) throw new Error('Plotting is only available for a Tiled launcher.');
     const ids = Array.isArray(entryIds) ? [...new Set(entryIds.map(id => String(id || '').trim()).filter(Boolean))] : [];
@@ -1058,7 +1109,7 @@ ipcMain.handle('tiled-open-plot', async (event, serverName, entryIds) => {
   }
 });
 
-ipcMain.handle('add-server', async (event, { serverName, serverConfig }) => {
+handleIpc('add-server', async (event, { serverName, serverConfig }) => {
   log.info(`IPC: add-server ${serverName}`);
   log.debug(`add-server: Config:`, serverConfig);
   sshOps.addServer(serverName, serverConfig);
@@ -1067,7 +1118,7 @@ ipcMain.handle('add-server', async (event, { serverName, serverConfig }) => {
   return { success: true };
 });
 
-ipcMain.handle('update-server', async (event, { serverName, serverConfig }) => {
+handleIpc('update-server', async (event, { serverName, serverConfig }) => {
   log.info(`IPC: update-server ${serverName}`);
   log.debug(`update-server: New config:`, serverConfig);
   sshOps.updateServer(serverName, serverConfig);
@@ -1076,7 +1127,7 @@ ipcMain.handle('update-server', async (event, { serverName, serverConfig }) => {
   return { success: true };
 });
 
-ipcMain.handle('remove-server', async (event, serverName) => {
+handleIpc('remove-server', async (event, serverName) => {
   log.info(`IPC: remove-server ${serverName}`);
   sshOps.removeServer(serverName);
   await sshOps.saveConfig();
@@ -1084,7 +1135,7 @@ ipcMain.handle('remove-server', async (event, serverName) => {
   return { success: true };
 });
 
-ipcMain.handle('toggle-server-active', async (event, serverName) => {
+handleIpc('toggle-server-active', async (event, serverName) => {
   log.info(`IPC: toggle-server-active ${serverName}`);
   sshOps.toggleServerActive(serverName);
   await sshOps.saveConfig();
@@ -1093,7 +1144,7 @@ ipcMain.handle('toggle-server-active', async (event, serverName) => {
   return { success: true };
 });
 
-ipcMain.handle('save-config', async () => {
+handleIpc('save-config', async () => {
   log.info('IPC: save-config');
   try {
     await sshOps.saveConfig();
@@ -1107,7 +1158,7 @@ ipcMain.handle('save-config', async () => {
 
 const sshConnections = {};
 
-ipcMain.handle('start-ssh-session', async (event, serverName) => {
+handleIpc('start-ssh-session', async (event, serverName) => {
   log.info(`IPC: start-ssh-session for ${serverName}`);
   
   // Close existing connection if any
@@ -1177,7 +1228,7 @@ ipcMain.handle('start-ssh-session', async (event, serverName) => {
   }
 });
 
-ipcMain.handle('close-ssh-session', async (event, serverName) => {
+handleIpc('close-ssh-session', async (event, serverName) => {
   log.info(`IPC: close-ssh-session for ${serverName}`);
   await closeSSHConnection(serverName);
   return { success: true };
@@ -1215,7 +1266,7 @@ ipcMain.on('resize-pty', (event, { serverName, cols, rows }) => {
   }
 });
 
-ipcMain.handle('set-config-path', async (event, newPath) => {
+handleIpc('set-config-path', async (event, newPath) => {
   log.info(`IPC: set-config-path to ${newPath}`);
   configPath = newPath;
   sshOps.setConfigPath(newPath);
@@ -1225,27 +1276,27 @@ ipcMain.handle('set-config-path', async (event, newPath) => {
 });
 
 
-ipcMain.handle('set-ssh-key-path', async (event, newPath) => {
+handleIpc('set-ssh-key-path', async (event, newPath) => {
   log.info(`IPC: set-ssh-key-path to ${newPath}`);
   sshKeyPath = newPath;
   sshOps.setSshKeyPath(newPath);
   return { success: true };
 });
 
-ipcMain.handle('get-paths', () => {
+handleIpc('get-paths', () => {
   log.debug('IPC: get-paths');
   // Return the actual loaded SSH key path from sshOps (may differ from default if fallback was used)
   return { configPath, sshKeyPath: sshOps.sshKeyPath || sshKeyPath };
 });
 
-ipcMain.handle('show-open-dialog', async (event, options) => {
+handleIpc('show-open-dialog', async (event, options) => {
   log.debug('IPC: show-open-dialog');
   const result = await dialog.showOpenDialog(mainWindow, options);
   log.debug(`show-open-dialog: canceled=${result.canceled}, files=${result.filePaths?.length || 0}`);
   return result;
 });
 
-ipcMain.handle('get-afl-config', async (event, host) => {
+handleIpc('get-afl-config', async (event, host) => {
   log.info(`IPC: get-afl-config for host ${host || 'local'}`);
   if (host) {
     log.debug(`get-afl-config: Fetching from remote host ${host}`);
@@ -1273,7 +1324,7 @@ ipcMain.handle('get-afl-config', async (event, host) => {
   }
 });
 
-ipcMain.handle('save-afl-config', async (event, host, cfg) => {
+handleIpc('save-afl-config', async (event, host, cfg) => {
   log.info(`IPC: save-afl-config for host ${host || 'local'}`);
   if (host) {
     log.debug(`save-afl-config: Saving to remote host ${host}`);

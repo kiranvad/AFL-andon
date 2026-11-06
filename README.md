@@ -36,9 +36,17 @@ screen and queue state every 500 ms. Launchers not started by the current
 Andon session are not polled, including active external or NAS profiles loaded
 from configuration. A failed SSH check displays **SSH DOWN**; an
 unreachable HTTP endpoint displays **SERVER DOWN**. Server cards and sidebar
-buttons use green for active, yellow for paused, and red for down. Detailed
-HTTP connection errors are written to the application terminal log rather than
-the card.
+buttons use green for active, yellow for paused, and red for down.
+
+Reported errors open a blocking dialog with the affected server and the exact
+error text. This includes failed server commands, HTTP health failures, Andon
+application errors, and Python tracebacks or error-level messages in live server
+output, including during startup. **Copy Errors** copies all displayed errors
+and server names to the clipboard. **Clear Errors** acknowledges them and returns
+access to Andon; Escape and clicking outside the dialog do not dismiss it.
+Clearing errors retains the combined logs and leaves server processes running.
+Repeated polling for the same failure is reported once until it recovers or
+changes; new failures open the dialog again.
 
 The **All Logs** sidebar view records each screen log's byte boundary just
 before Start or Restart, then opens a continuous SSH follow stream as soon as
@@ -58,8 +66,11 @@ polling diagnostics remain in `~/.afl/logs/afl-andon.log` at debug level.
 When the window is closed from the GUI, Andon asks for confirmation before it
 sends the normal stop command to every launcher started or restarted during
 that Andon session. NAS-managed Tiled containers are disconnected instead of
-stopped. The same cleanup runs on `SIGINT`/`SIGTERM`. Launchers that were
-already running when Andon opened are not stopped.
+stopped. Closing the terminal used to launch Andon also runs the same cleanup,
+including when `npm start` or Electron's launch wrapper exits without forwarding
+the terminal hangup. Cleanup also runs on `SIGINT`, `SIGTERM`, `SIGHUP`, and
+`SIGQUIT`, and repeated signals do not interrupt it. Launchers that were already
+running when Andon opened are not stopped.
 
 ## Prerequisites
 
@@ -100,6 +111,21 @@ By default the app uses `~/.afl/launchers.json` for server definitions and
 variables or via `--config` and `--ssh-key` command‑line options.  The
 Settings tab also provides buttons to change them at runtime.
 
+For **Module**, **Script**, and **Tiled** launchers, select **Password** in
+the server editor's **SSH Authentication** field to use a password-only SSH account.
+Andon prompts before the first operation requiring SSH and reuses that
+password for Start, Stop, Restart, status checks, config uploads, logs, and
+Join during the session. A rejected password is discarded so the next
+operation can prompt again. Passwords remain only in process memory and are
+never saved in launcher or runtime configuration files.
+
+The selected mode is stored as `"ssh_authentication": "password"` or
+`"ssh_authentication": "key"` in `launchers.json`. This field takes precedence
+over a Tiled profile's legacy `management.authentication` setting. Existing
+Tiled launchers without this field retain that YAML setting; other launchers
+without this field default to SSH keys. Session passwords are shared by
+launchers using the same host, username, and SSH port.
+
 To offer common local config files while adding or editing a launcher, add a
 top-level `configs_locations` entry to `launchers.json` with a directory path:
 
@@ -119,7 +145,16 @@ The Settings tab reads and writes one current configuration file at
 host) and does not embed driver custom configurations. After a Tiled launcher
 passes its health check, Andon appends a record to AFL-automation's global
 `~/.afl/config.json` with that launcher's URL and API key. Drivers started later
-in the same session therefore use the active Tiled service. The native Tiled
+in the same session automatically receive that connection for both Module
+and Script launches. Andon updates the launching account's AFL global config
+on its server host before starting the process, preserving other settings and
+ports. Remote drivers using HTTP Tiled connect through an SSH tunnel managed
+by Andon: the driver connects to a loopback port on its own host, and the
+control computer forwards traffic to the selected Tiled service. This works
+when the control computer can reach Tiled but the driver host cannot. After
+reopening Andon, it discovers a healthy enabled Tiled card, preferring a card
+named **tiled**. Before launch, Andon verifies authenticated Tiled access from
+the driver's SSH account through the selected endpoint or tunnel. The native Tiled
 browser may also read the latest `tiled_api_key` from that global file as a
 credential fallback when its selected Tiled YAML does not define a key.
 
@@ -142,12 +177,51 @@ persistent configuration behavior. Andon also passes the launcher's **HTTP
 Port** to AFL as `--port`, so the server and Andon's health checks use the same
 endpoint.
 
+### Launching a local script on a server
+
+Select **Server Type: Script**, then use **Browse** beside **Server Script**
+to select a launcher file on the computer running Andon. You can also paste
+its local path into the field. Keep deployment-specific scripts and settings
+in a private location outside this repository.
+
+Andon copies the file to the selected SSH account's `~/.afl/scripts/` directory
+and runs it in the launcher's Screen session. The file is copied again on
+each Start or Restart. Scripts with a shebang use their own interpreter;
+files without one use the card's Shell. Existing server-side script commands
+remain supported. The script can activate its environment and set its working
+directory before starting the server.
+
+Local script paths are saved only as `script_file_location`. The legacy
+`server_script` field holds commands that already exist on the server; Andon
+removes duplicate script paths when saving the launcher configuration.
+
+The card's **HTTP Port** is passed to Module and Script launches as
+`AFL_HTTP_PORT`; Module launches also receive `--port`. AFL's shared launcher uses this value ahead of its saved
+`ports` mapping and default port, so scripts that use the AFL launcher need
+no separate port setting. The server's AFL-automation installation must
+include support for `AFL_HTTP_PORT`. Custom servers can read the same
+environment variable when choosing their listening port.
+
+Start Tiled before starting a driver. Andon supplies the current Tiled URL and
+API key through the server account's standard AFL global config; scripts do
+not need Tiled connection code. For HTTP services, Andon establishes the
+tunnel before configuring and starting a remote driver. Local Tiled may
+listen only on the control computer's loopback interface; NAS Tiled only
+needs to be reachable from the control computer. The driver host's SSH
+server must allow remote TCP forwarding. Tunnels share a connection for
+drivers using the same SSH account and Tiled service, reconnect on the same
+port after an interruption, and close when their last driver stops or Andon
+shuts down. Keep Andon running while these drivers send data. HTTPS services
+continue to use direct connections from the driver host. Credentials remain
+in private runtime configuration.
+
 ## Localhost SSH Setup
 
 If a server entry uses `localhost`, AFL Andon still manages it through SSH.
 That means the current user must be able to SSH back into the same machine
-with a configured private key before start, stop, restart, and status checks
-will work.
+with the launcher's selected authentication method before start, stop,
+restart, and status checks will work. Launchers can use
+password authentication as described above. To use SSH keys instead:
 
 Add one of your local public keys to `~/.ssh/authorized_keys`:
 
@@ -227,12 +301,35 @@ local `~/.afl/config.json`.
 
 ### External Tiled server profile
 
+To run a local AFL server that connects to an existing Tiled HTTP service, use
+a private client YAML in `afl-configs`:
+
+```yaml
+uri: "http://<nas-host>:<nas-tiled-port>"
+authentication:
+  single_user_api_key: "<nas-api-key>"
+structure_clients: "dask"
+management:
+  type: "afl_proxy"
+```
+
+Keep the Tiled card's Host and Username set to the computer running the proxy,
+choose its virtualenv, select that client YAML as **Config file location**, and
+use a free local HTTP port. Andon starts
+`python -m AFL.automation.shared.TiledProxyDriver` from that environment through
+the existing Screen controls. The proxy driver must be installed from
+AFL-automation. The card layout, Start/Stop/Restart, View Log, Join, and bundled
+Tiled browser stay the same. The browser reaches the local proxy, which forwards
+authenticated requests to the configured NAS. Stopping the card stops only the
+local AFL proxy. A client YAML with `uri` and no management block also selects
+this mode.
+
 Andon distinguishes the two Tiled YAML forms automatically:
 
 - A native service configuration containing `trees` is locally managed. Andon
   can start and stop it with `tiled serve config`.
 - A client profile containing `uri` connects to an existing service. Its
-  `management` block selects how Andon controls that service.
+  `management` block selects a local AFL proxy or remote lifecycle management.
 
 For example, a Synology-hosted service can use:
 
@@ -245,7 +342,6 @@ uvicorn:
 structure_clients: "dask"
 management:
   type: "docker_compose"
-  authentication: "password"
   host: "192.0.2.10"
   username: "nas-user"
   project_directory: "/srv/tiled-project"
@@ -257,6 +353,10 @@ This mirrors the authentication and Uvicorn sections in `tiled_local.yml`.
 For a NAS profile, Andon derives the public HTTP endpoint from
 `management.host` and `uvicorn.port`; the `management` section is the only
 additional lifecycle configuration.
+
+Select **Password** in the Tiled card's **SSH Authentication** field. Andon
+saves `"ssh_authentication": "password"` in `launchers.json`; the YAML's
+top-level `authentication` block configures the Tiled HTTP API credential.
 
 Local and NAS-backed Tiled launchers use the same connection summary on the
 Andon board: `SSH: username@host, HTTP: host:port`. The selected YAML profile
@@ -273,8 +373,8 @@ SSH account must accept the selected authentication
 method and have permission to run `sudo`. Docker Compose is never invoked as
 the login user: Andon opens a root login shell with `sudo -i` and supplies the
 same in-memory password over SSH standard input.
-When `management.authentication` is `password`, clicking Start prompts for the
-SSH password. Andon keeps it only in process memory for subsequent status,
+When the card's **SSH Authentication** is **Password**, clicking Start prompts
+for the SSH password. Andon keeps it only in process memory for subsequent status,
 log, and Join connections and discards it when Andon exits. Both SSH password
 and keyboard-interactive password login are supported; the latter is commonly
 used by Synology DSM even when an interactive `ssh` command simply says

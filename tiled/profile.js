@@ -21,8 +21,8 @@ function normalizeManagement(profile, mode, profilePath) {
   if (mode === 'local') return { type: 'screen' };
 
   const management = profile.management || {};
-  const type = String(management.type || 'external').trim();
-  if (type === 'external') return { type };
+  const type = String(management.type || 'afl_proxy').trim();
+  if (['external', 'afl_proxy'].includes(type)) return { type };
   if (type !== 'docker_compose') {
     throw new Error(`Tiled profile ${profilePath} has unsupported management type "${type}".`);
   }
@@ -89,7 +89,7 @@ async function loadTiledProfile(profilePath, options = {}) {
   }
 
   return {
-    mode: external ? 'external' : 'local',
+    mode: management.type === 'afl_proxy' ? 'proxy' : (external ? 'external' : 'local'),
     uri,
     apiKey,
     management,
@@ -98,4 +98,8 @@ async function loadTiledProfile(profilePath, options = {}) {
   };
 }
 
-module.exports = { loadTiledProfile, normalizeHttpUrl, normalizeManagement };
+function isTiledProxy(server) {
+  return server?.server_type === 'tiled' && server.tiled_management?.type === 'afl_proxy';
+}
+
+module.exports = { loadTiledProfile, normalizeHttpUrl, normalizeManagement, isTiledProxy };

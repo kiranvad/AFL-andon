@@ -12,7 +12,7 @@ allow_origins:
   - http://localhost:5001
   - http://localhost:5005
   - http://localhost:5053
-  - http://piloader:5000
+  - http://loader.example:5000
 trees:
   - path: /
     tree: catalog
