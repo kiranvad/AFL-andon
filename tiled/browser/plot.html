@@ -8,7 +8,8 @@
   <header><div><h1>Tiled Plot Viewer</h1><p id="plot-status">Loading selected data…</p></div><button id="close-window" type="button">Close</button></header>
   <main>
     <aside aria-label="Dataset selector">
-      <h2>Dataset</h2><label>Select dataset<select id="dataset-select"></select></label>
+      <h2>Dataset</h2><label><span id="dataset-select-label">Select dataset</span><select id="dataset-select"></select></label>
+      <label id="overlay-control" hidden><input id="overlay-enabled" type="checkbox"> Overlay compatible datasets</label>
       <section id="controls" aria-label="Plot controls">
         <h2>Plot configuration</h2>
         <label>Plot type<select id="plot-mode"><option value="scatter3d">Scatter 3D</option><option value="scatter2d">Scatter 2D</option><option value="line">Line 1D</option><option value="contour">Contourf 2D</option><option value="heatmap">Heatmap</option><option value="image">Image</option></select></label>

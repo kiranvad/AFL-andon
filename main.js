@@ -80,7 +80,8 @@ function handleIpc(channel, handler) {
     return ipcErrorContext.run(context, async () => {
       try {
         const result = await handler(event, ...args);
-        if (!result?.canceled && (result?.success === false || result?.ok === false || result?.degraded)) {
+        const healthUnavailable = channel === 'tiled-ping' && result?.ok === false;
+        if (!result?.canceled && !healthUnavailable && (result?.success === false || result?.ok === false)) {
           const message = result.error || result.reason || result.warning || result.message ||
             (result.sshDown ? 'SSH connection failed.' : 'Operation failed.');
           if (!context.reported.some(text => text.includes(errorText(message)))) {
@@ -834,7 +835,11 @@ handleIpc('restart-server', async (event, serverName) => {
       log.error(`restart-server: ${serverName} failed to restart: ${result.error || 'Unknown error'}`);
       return result;
     }
-    log.info(`restart-server: ${serverName} restarted successfully`);
+    if (result.degraded) {
+      log.warn(`restart-server: ${serverName} restarted in degraded state: ${result.warning}`);
+    } else {
+      log.info(`restart-server: ${serverName} restarted successfully`);
+    }
     return result;
   } catch (error) {
     stopSessionLogStream(serverName, false);

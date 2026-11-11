@@ -69,7 +69,7 @@ async function setup(options = {}) {
   }, { filename: mainPath });
   await new Promise(resolve => setImmediate(resolve));
   const invoke = (channel, ...args) => handlers.get(channel)({ sender: {} }, ...args);
-  return { operations, logger, streamCallbacks, invoke, errors: () => events.filter(event => event.type === 'error') };
+  return { operations, logger, streamCallbacks, invoke, events, errors: () => events.filter(event => event.type === 'error') };
 }
 
 test('failed SSH results preserve exact errors and command output with the affected server', async () => {
@@ -167,5 +167,34 @@ test('canceling a file selection is not reported as an error', async () => {
   const { invoke, errors } = await setup();
   const result = await invoke('import-config');
   assert.equal(result.canceled, true);
+  assert.equal(errors().length, 0);
+});
+
+for (const action of ['start', 'restart']) {
+  test(`${action} with a live process and unavailable HTTP emits a warning without an error event`, async () => {
+    const { operations, invoke, events, errors } = await setup();
+    const warning = 'Server process started but HTTP is not reachable at http://localhost:5000/queue_state: fetch failed';
+    operations[action === 'start' ? 'startServer' : 'restartServer'] = async () => ({
+      success: true, degraded: true, warning, output: 'Server launch output'
+    });
+    const result = await invoke(`${action}-server`, 'Sulphur');
+    assert.equal(result.success, true);
+    assert.equal(result.degraded, true);
+    assert.equal(errors().length, 0);
+    assert.ok(events.some(event => event.type === 'data' && event.data.includes('[WARN]') && event.data.includes(warning)));
+  });
+}
+
+test('unavailable Tiled health does not produce error events through the IPC boundary', async () => {
+  const { invoke, errors } = await setup({
+    config: { tiled: {
+      server_type: 'tiled', host: 'localhost', httpPort: 8001,
+      config_file_location: '/profiles/http.yml', tiled_management: { type: 'afl_proxy' }
+    } },
+    profile: { mode: 'proxy', uri: 'http://tiled.example:8000/', apiKey: 'test-key' },
+    fetch: async () => { throw new Error('fetch failed'); }
+  });
+  const result = await invoke('tiled-ping', 'tiled');
+  assert.equal(result.ok, false);
   assert.equal(errors().length, 0);
 });

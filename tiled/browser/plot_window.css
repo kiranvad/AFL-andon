@@ -15,8 +15,9 @@ aside { padding: 16px; overflow: auto; background: #fff; border-right: 1px solid
 aside label, #controls label { display: grid; gap: 4px; margin-bottom: 13px; font-weight: 600; color: #415364; }
 aside section { margin-top: 20px; }
 #controls h2 { margin-bottom: 10px; }
-#color-toggle-control { display: flex !important; align-items: center; gap: 6px; }
-#color-toggle-control input { margin: 0; }
+#color-toggle-control, #overlay-control { display: flex; align-items: center; gap: 6px; }
+#color-toggle-control input, #overlay-control input { margin: 0; }
+[hidden] { display: none !important; }
 .axis-grid { display: grid; gap: 9px; }
 .axis-grid fieldset { min-width: 0; margin: 0; padding: 8px; border: 1px solid #d5dce3; border-radius: 4px; }
 .axis-grid legend { padding: 0 4px; font-weight: 600; color: #415364; }

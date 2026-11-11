@@ -5,6 +5,10 @@
   try { entryIds = JSON.parse(query.get('plotEntries') || '[]'); } catch (_) { entryIds = []; }
   const state = { datasets: [], slices: {}, mode: 'auto' };
   const $ = id => document.getElementById(id);
+  const traceColors = ['#636efa', '#ef553b', '#00cc96', '#ab63fa', '#ffa15a', '#19d3f3', '#ff6692', '#b6e880', '#ff97ff', '#fecb52'];
+  const traceSymbols = ['circle', 'square', 'diamond', 'cross', 'x', 'circle-open', 'square-open', 'diamond-open'];
+  const supportsOverlay = () => ['line', 'scatter2d', 'scatter3d'].includes($('plot-mode').value);
+  const overlayEnabled = () => supportsOverlay() && $('overlay-enabled').checked;
   const plotVariable = () => {
     const mode = $('plot-mode').value;
     const axis = mode === 'scatter3d' ? 'z' : mode === 'line' ? 'y' : 'color';
@@ -12,6 +16,10 @@
   };
   const activeDataset = () => state.datasets[Number($('dataset-select').value) || 0];
   const showError = message => { $('plot-error').textContent = message || ''; $('plot-error').hidden = !message; };
+  const datasetLabel = dataset => {
+    const metadata = dataset.metadata?.data?.attributes?.metadata || {};
+    return metadata.sample_name ? `${metadata.sample_name} (${dataset.id})` : dataset.id;
+  };
 
   function options(select, values, selected) {
     select.replaceChildren();
@@ -25,6 +33,9 @@
 
   function renderControls() {
     const dataset = activeDataset(); if (!dataset) return;
+    $('overlay-control').hidden = state.datasets.length < 2;
+    $('overlay-enabled').disabled = !supportsOverlay();
+    $('dataset-select-label').textContent = overlayEnabled() ? 'Axes from dataset' : 'Select dataset';
     // Higher-rank numeric arrays remain useful outside Image mode: the slice
     // controls reduce them to the rank required by the selected plot type.
     const series = dataset.variables.filter(item => item.numeric && item.shape.length);
@@ -32,18 +43,21 @@
     const imageVariables = dataset.variables.filter(item => window.TiledPlotUtils.imageRenderData(item, state.slices));
     const preferred = window.TiledPlotUtils.preferredVariable(series);
     const defaultZ = series.find(item => item.shape.length === 2) || series[0];
+    const defaultY = window.TiledPlotUtils.preferredVariable(series, [preferred?.name]) || defaultZ;
     const componentSeries = series.find(item => window.TiledPlotUtils.axisComponentOptions(item).length >= 3);
     for (const axis of ['x', 'y', 'z', 'color']) {
       const choices = $('plot-mode').value === 'image' && axis === 'color' ? imageVariables : series;
       const defaultVariable = $('plot-mode').value === 'image' && axis === 'color'
         ? imageVariable?.name
-        : componentSeries?.name || (axis === 'x' ? preferred?.name : defaultZ?.name);
-      options($(`axis-${axis}`), choices.map(item => ({ value: item.name, label: item.name })), $(`axis-${axis}`).value || defaultVariable);
+        : componentSeries?.name || (axis === 'x' ? preferred?.name : axis === 'y' ? defaultY?.name : defaultZ?.name);
+      const previousVariable = $(`axis-${axis}`).value;
+      options($(`axis-${axis}`), choices.map(item => ({ value: item.name, label: item.name })), choices.some(item => item.name === previousVariable) ? previousVariable : defaultVariable);
       const axisVariable = dataset.variables.find(item => item.name === $(`axis-${axis}`).value);
       const components = window.TiledPlotUtils.axisComponentOptions(axisVariable);
       const componentSelect = $(`axis-${axis}-component`);
       const initialComponent = components[['x', 'y', 'z', 'color'].indexOf(axis)]?.value || components[0]?.value;
-      options(componentSelect, components.length ? components : [{ value: '', label: 'Not applicable' }], componentSelect.value || initialComponent);
+      const previousComponent = componentSelect.selectedOptions[0]?.textContent;
+      options(componentSelect, components.length ? components : [{ value: '', label: 'Not applicable' }], components.find(item => item.label === previousComponent)?.value || initialComponent);
       componentSelect.disabled = !axisVariable || axisVariable.shape.length <= 1 || !components.length;
     }
     const is3d = $('plot-mode').value === 'scatter3d';
@@ -64,24 +78,32 @@
       const label = document.createElement('label'); label.className = 'slice-control'; label.textContent = `Slice ${dim.name}`;
       const input = document.createElement('input'); input.type = 'range'; input.min = '0'; input.max = String(Math.max(0, dim.size - 1)); input.value = String(state.slices[dim.name] || 0);
       const value = document.createElement('span'); const update = () => { state.slices[dim.name] = Number(input.value); value.textContent = dim.coordinateValues?.[Number(input.value)] ?? input.value; draw(); };
-      input.addEventListener('input', update); update(); label.append(input, value); sliceContainer.append(label);
+      input.addEventListener('input', update); value.textContent = dim.coordinateValues?.[Number(input.value)] ?? input.value; label.append(input, value); sliceContainer.append(label);
     });
   }
 
-  function valuesForAxis(axis) {
-    const item = activeDataset()?.variables.find(entry => entry.name === $(`axis-${axis}`).value);
-    const resolved = window.TiledPlotUtils.resolveAxis(item, $(`axis-${axis}-component`).value);
-    return resolved?.values || window.TiledPlotUtils.sliceToRank(item, 1, state.slices)?.values || [];
+  function valuesForAxis(axis, dataset = activeDataset()) {
+    const reference = activeDataset()?.variables.find(entry => entry.name === $(`axis-${axis}`).value);
+    const item = dataset?.variables.find(entry => entry.name === reference?.name);
+    if (!supportsOverlay()) {
+      const resolved = window.TiledPlotUtils.resolveAxis(item, $(`axis-${axis}-component`).value);
+      return resolved?.values || window.TiledPlotUtils.sliceToRank(item, 1, state.slices)?.values || [];
+    }
+    return window.TiledPlotUtils.compatibleAxisValues(item, reference, $(`axis-${axis}-component`).value, state.slices);
   }
   function axisLabel(axis) {
     const component = $(`axis-${axis}-component`);
     return component.disabled ? $(`axis-${axis}`).value : component.selectedOptions[0]?.textContent || $(`axis-${axis}`).value;
   }
-  function linePlot() {
-    const x = valuesForAxis('x'); const y = valuesForAxis('y'); if (x.length !== y.length) throw new Error('Line plotting requires X and Y series of the same length.');
-    const compact = window.TiledPlotUtils.downsampleAligned([x, y], 50000);
-    window.Plotly.react('plot-widget', [{ type: 'scattergl', mode: 'lines+markers', x: compact.values[0], y: compact.values[1], name: axisLabel('y') }], { margin: { t: 35, b: 50, l: 60, r: 20 }, xaxis: { title: axisLabel('x') }, yaxis: { title: axisLabel('y') } }, { responsive: true, displayModeBar: true });
-    return compact.reduced;
+  function xyTrace(dataset, kind) {
+    const x = valuesForAxis('x', dataset); const y = valuesForAxis('y', dataset);
+    if (x.length !== y.length) throw new Error('X and Y series must have the same length within each dataset.');
+    const color = kind === 'scatter2d' ? valuesForAxis('color', dataset) : null;
+    if (color && color.length !== x.length) throw new Error('Color series must have the same length as X and Y.');
+    const compact = window.TiledPlotUtils.downsampleAligned(color ? [x, y, color] : [x, y], 50000);
+    const index = state.datasets.indexOf(dataset);
+    const trace = { type: 'scattergl', mode: kind === 'line' ? 'lines+markers' : 'markers', x: compact.values[0], y: compact.values[1], line: { color: traceColors[index % traceColors.length] }, marker: color ? { color: compact.values[2], coloraxis: 'coloraxis', symbol: traceSymbols[index % traceSymbols.length] } : { color: traceColors[index % traceColors.length] } };
+    return { trace, reduced: compact.reduced };
   }
   function surfacePlot(kind) {
     const variable = plotVariable();
@@ -112,9 +134,9 @@
     window.Plotly.react('plot-widget', [{ type: 'mesh3d', x: values.map(point => point[0]), y: values.map(point => point[1]), z: values.map(() => 0), intensity: values.map(point => point[2]), colorscale: 'Viridis', alphahull: -1, flatshading: false, showscale: true, colorbar: { title: axisLabel('color') }, hovertemplate: `x=%{x}<br>y=%{y}<br>${axisLabel('color')}=%{intensity}<extra></extra>` }], { margin: { t: 25, b: 15, l: 15, r: 15 }, scene: { camera: { projection: { type: 'orthographic' }, eye: { x: 0, y: 0, z: 2.5 } }, xaxis: { title: axisLabel('x') }, yaxis: { title: axisLabel('y') }, zaxis: { visible: false } } }, { responsive: true, displayModeBar: true });
     return compact.reduced;
   }
-  function pointPlot() {
-    const x = valuesForAxis('x'); const y = valuesForAxis('y'); const z = valuesForAxis('z');
-    const color = $('color-enabled').checked ? valuesForAxis('color') : null;
+  function pointTrace(dataset) {
+    const x = valuesForAxis('x', dataset); const y = valuesForAxis('y', dataset); const z = valuesForAxis('z', dataset);
+    const color = $('color-enabled').checked ? valuesForAxis('color', dataset) : null;
     if (color && color.length !== x.length) throw new Error('3D point color requires a series with the same length as X, Y, and Z.');
     if (x.length !== y.length || x.length !== z.length) throw new Error('Point plotting requires compatible numeric X, Y, and Z series.');
     const points = [];
@@ -124,25 +146,41 @@
     });
     if (!points.length) throw new Error('Point plotting requires compatible numeric X, Y, and Z series.');
     const compact = window.TiledPlotUtils.downsample(points, 50000); const values = compact.values;
-    const labels = { x: axisLabel('x'), y: axisLabel('y'), z: axisLabel('z') };
-    const trace = { type: 'scatter3d', mode: 'markers', x: values.map(p => p[0]), y: values.map(p => p[1]), z: values.map(p => p[2]), marker: color ? { size: 4, color: values.map(p => p[3]), colorscale: 'Viridis', showscale: true, colorbar: { title: axisLabel('color') } } : { size: 4 } };
-    const layout = { margin: { t: 35, b: 10, l: 10, r: 10 }, scene: { xaxis: { title: labels.x }, yaxis: { title: labels.y }, zaxis: { title: labels.z } } };
-    window.Plotly.react('plot-widget', [trace], layout, { responsive: true, displayModeBar: true }); return compact.reduced;
+    const index = state.datasets.indexOf(dataset);
+    const trace = { type: 'scatter3d', mode: 'markers', x: values.map(p => p[0]), y: values.map(p => p[1]), z: values.map(p => p[2]), marker: color ? { size: 4, color: values.map(p => p[3]), coloraxis: 'coloraxis', symbol: traceSymbols[index % traceSymbols.length] } : { size: 4, color: traceColors[index % traceColors.length] } };
+    return { trace, reduced: compact.reduced };
   }
-  function scatter2dPlot() {
-    const x = valuesForAxis('x'); const y = valuesForAxis('y'); if (x.length !== y.length) throw new Error('Scatter 2D requires X and Y series of the same length.');
-    const compact = window.TiledPlotUtils.downsampleAligned([x, y], 50000);
-    const color = valuesForAxis('color');
-    if (color.length && color.length !== x.length) throw new Error('Scatter 2D color requires a series with the same length as X and Y.');
-    const compactColor = color.length ? window.TiledPlotUtils.downsampleAligned([x, color], 50000)?.values[1] : null;
-    window.Plotly.react('plot-widget', [{ type: 'scattergl', mode: 'markers', x: compact.values[0], y: compact.values[1], marker: compactColor ? { color: compactColor, colorscale: 'Viridis', showscale: true, colorbar: { title: axisLabel('color') } } : undefined }], { margin: { t: 35, b: 50, l: 60, r: 20 }, xaxis: { title: axisLabel('x') }, yaxis: { title: axisLabel('y') } }, { responsive: true, displayModeBar: true }); return compact.reduced;
+  function seriesPlot(kind) {
+    const datasets = overlayEnabled() ? state.datasets : [activeDataset()];
+    const traces = []; const skipped = []; let reduced = false;
+    datasets.forEach(dataset => {
+      try {
+        const result = kind === 'scatter3d' ? pointTrace(dataset) : xyTrace(dataset, kind);
+        traces.push({ ...result.trace, name: datasetLabel(dataset), uid: dataset.id, legendgroup: dataset.id });
+        reduced ||= result.reduced;
+      } catch (error) { skipped.push(`${datasetLabel(dataset)}: ${error.message}`); }
+    });
+    if (!traces.length) throw new Error(skipped.join(' '));
+    const layout = kind === 'scatter3d'
+      ? { margin: { t: 35, b: 10, l: 10, r: 10 }, scene: { xaxis: { title: axisLabel('x') }, yaxis: { title: axisLabel('y') }, zaxis: { title: axisLabel('z') } } }
+      : { margin: { t: 35, b: 50, l: 60, r: 20 }, xaxis: { title: axisLabel('x') }, yaxis: { title: axisLabel('y') } };
+    layout.showlegend = true;
+    layout.hoverlabel = { namelength: -1 };
+    if (kind === 'scatter2d' || (kind === 'scatter3d' && $('color-enabled').checked)) {
+      layout.coloraxis = { colorscale: 'Viridis', colorbar: { title: axisLabel('color') } };
+    }
+    window.Plotly.react('plot-widget', traces, layout, { responsive: true, displayModeBar: true });
+    if (skipped.length) $('recommendation').textContent = `Skipped ${skipped.length} incompatible dataset${skipped.length === 1 ? '' : 's'}. ${skipped.join(' ')}`;
+    return { reduced, count: traces.length };
   }
   function draw() {
     const selected = plotVariable(); if (!selected) return;
     const mode = $('plot-mode').value; $('recommendation').textContent = ''; showError();
     try {
-      const reduced = mode === 'scatter3d' ? pointPlot() : mode === 'scatter2d' ? scatter2dPlot() : mode === 'contour' && selected.shape.length === 1 ? triContourPlot() : ['contour', 'heatmap', 'image'].includes(mode) ? surfacePlot(mode) : linePlot();
-      $('downsample-note').hidden = !reduced; $('downsample-note').textContent = reduced ? 'Large series was uniformly downsampled to 50,000 points.' : '';
+      const result = supportsOverlay() ? seriesPlot(mode) : { reduced: mode === 'contour' && selected.shape.length === 1 ? triContourPlot() : surfacePlot(mode), count: 1 };
+      $('plot-status').textContent = `${state.datasets.length} selected dataset${state.datasets.length === 1 ? '' : 's'} loaded · ${result.count} plotted`;
+      if (!supportsOverlay() && state.datasets.length > 1) $('recommendation').textContent = 'Overlay is available for Line 1D, Scatter 2D, and Scatter 3D. This plot shows the selected dataset.';
+      $('downsample-note').hidden = !result.reduced; $('downsample-note').textContent = result.reduced ? 'Large series were uniformly downsampled to at most 50,000 points per dataset.' : '';
     } catch (error) { window.Plotly.purge('plot-widget'); $('downsample-note').hidden = true; showError(error.message); }
   }
 
@@ -169,7 +207,8 @@
       }));
       state.datasets = results.filter(dataset => dataset.variables.some(item => item.numeric));
       if (!state.datasets.length) throw new Error('The selected entries contain no numeric arrays.');
-      options($('dataset-select'), state.datasets.map((dataset, index) => ({ value: index, label: dataset.id })), '0'); $('plot-status').textContent = `${state.datasets.length} selected dataset${state.datasets.length === 1 ? '' : 's'} loaded`;
+      options($('dataset-select'), state.datasets.map((dataset, index) => ({ value: String(index), label: datasetLabel(dataset) })), '0'); $('plot-status').textContent = `${state.datasets.length} selected dataset${state.datasets.length === 1 ? '' : 's'} loaded`;
+      $('overlay-enabled').checked = state.datasets.length > 1;
       $('plot-mode').value = window.TiledPlotUtils.defaultPlotMode(activeDataset()?.variables || []);
       renderExplorer(); draw();
     } catch (error) { showError(error.message || 'Unable to load Tiled data.'); }
@@ -177,10 +216,10 @@
   document.addEventListener('DOMContentLoaded', () => {
     $('dataset-select').addEventListener('change', () => {
       state.slices = {};
-      $('plot-mode').value = window.TiledPlotUtils.defaultPlotMode(activeDataset()?.variables || []);
+      if (!overlayEnabled()) $('plot-mode').value = window.TiledPlotUtils.defaultPlotMode(activeDataset()?.variables || []);
       renderExplorer(); draw();
     });
-    ['plot-mode', 'color-enabled', 'axis-x', 'axis-y', 'axis-z', 'axis-color', 'axis-x-component', 'axis-y-component', 'axis-z-component', 'axis-color-component'].forEach(id => $(id).addEventListener('change', () => { renderControls(); draw(); }));
+    ['plot-mode', 'overlay-enabled', 'color-enabled', 'axis-x', 'axis-y', 'axis-z', 'axis-color', 'axis-x-component', 'axis-y-component', 'axis-z-component', 'axis-color-component'].forEach(id => $(id).addEventListener('change', () => { renderControls(); draw(); }));
     $('close-window').addEventListener('click', () => window.close()); load();
   });
 })();

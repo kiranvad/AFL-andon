@@ -49,6 +49,7 @@ let loadedWebviewServerName = null;
 let inactiveExpanded = false;
 const startedServers = new Set();
 const displayedServerStatuses = new Map();
+const queueHealthWarnings = new Map();
 const allLogServers = new Map();
 let mergedLogEntries = [];
 let allLogsPaused = false;
@@ -520,18 +521,19 @@ async function fetchQueueState(serverName) {
   }
   const url = serverConfig.status_url ||
               `http://${serverConfig.host}:${serverConfig.httpPort}/queue_state`;
-  if (serverConfig.server_type === 'tiled') {
-    const result = await ipcRenderer.invoke('tiled-ping', serverName);
-    return {
-      ok: !!result?.ok,
-      state: result?.state || null,
-      url: result?.url || url,
-      reason: result?.reason || null
-    };
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 500);
+  let timer;
   try {
+    if (serverConfig.server_type === 'tiled') {
+      const result = await ipcRenderer.invoke('tiled-ping', serverName);
+      return {
+        ok: !!result?.ok,
+        state: result?.state || null,
+        url: result?.url || url,
+        reason: result?.reason || null
+      };
+    }
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), 500);
     const response = await fetchFn(url, { signal: controller.signal });
     if (!response.ok) {
       const reason = `HTTP ${response.status} from ${url}`;
@@ -596,9 +598,10 @@ function updateServerStatusUI(serverName, screenResult, queueResult) {
   const serverStatus = serverActivityPresentation(queueResult);
   if (startedServers.has(serverName)) {
     if (queueResult?.ok) {
-      errorDialog.resolve(`health:${serverName}`);
-    } else if (queueResult?.reason) {
-      errorDialog.reportOnce(`health:${serverName}`, serverName, queueResult.reason);
+      queueHealthWarnings.delete(serverName);
+    } else if (queueResult?.reason && queueHealthWarnings.get(serverName) !== queueResult.reason) {
+      queueHealthWarnings.set(serverName, queueResult.reason);
+      log.warn(`${serverName}: Queue state unavailable: ${queueResult.reason}`);
     }
     if (screenResult.error) {
       errorDialog.reportOnce(`ssh:${serverName}`, serverName, screenResult.error);
@@ -649,6 +652,7 @@ function logServerStatusChange(serverName, sshConnected, serverState) {
 }
 
 function showServerDownStatus(serverName, disconnected = false) {
+  queueHealthWarnings.delete(serverName);
   const screenStatusElement = document.getElementById(`${serverName}-screen-status`);
   const httpStatusElement = document.getElementById(`${serverName}-http-status`);
   if (screenStatusElement) {
@@ -733,8 +737,7 @@ async function batchUpdateServerStatuses() {
             try {
               queueResult = await fetchQueueState(serverName);
             } catch (err) {
-              log.error(`Error fetching queue state for ${serverName}:`, err.message);
-              queueResult = { ok: false, state: null };
+              queueResult = { ok: false, state: null, reason: err.message || 'Queue state check failed.' };
             }
 
             // Update the UI
@@ -764,13 +767,17 @@ async function controlServer(serverName, action) {
     }
     showServerDownStatus(serverName, disconnectOnly);
     const result = await ipcRenderer.invoke(`${action}-server`, serverName);
-    if (!result.success || result.degraded) {
+    if (!result.success) {
       errorDialog.report(serverName, result.error || result.warning ||
         (result.sshDown ? 'SSH connection failed.' : 'Unknown error'));
       if (result.output) errorDialog.report(serverName, result.output);
     }
     if (result.success) {
-      log.info(`${action} successful for ${serverName}`);
+      if (result.degraded || result.warning) {
+        log.warn(`${action} completed with a warning for ${serverName}: ${result.warning || 'Server is in a degraded state.'}`);
+      } else {
+        log.info(`${action} successful for ${serverName}`);
+      }
     } else if (result.authenticationRequired) {
       log.warn(`SSH authentication is required for ${serverName}`);
     } else if (result.sshDown) {

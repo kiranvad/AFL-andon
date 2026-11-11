@@ -128,6 +128,44 @@
     return { values: variable.values, xDimension: variable.dims[1], yDimension: variable.dims[0], label: variable.name };
   }
 
+  // Match the chosen variable and component across entries. Each entry keeps
+  // its own coordinates and length; labeled components and slices are matched
+  // by coordinate value so a reordered component list cannot change the axis.
+  function compatibleAxisValues(variable, reference, component, sliceIndexes = {}) {
+    if (!variable?.numeric || variable.name !== reference?.name) throw new Error(`Missing numeric variable ${reference?.name || ''}.`);
+    if (variable.shape.length !== reference.shape.length || variable.dims.some((dim, index) => dim.name !== reference.dims[index]?.name)) {
+      throw new Error(`Variable ${reference.name} has different dimensions.`);
+    }
+    const matchingIndex = (dimensionIndex, index) => {
+      const dimension = variable.dims[dimensionIndex];
+      const referenceDimension = reference.dims[dimensionIndex];
+      const coordinate = referenceDimension.coordinateValues[index];
+      const matched = referenceDimension.coordinateName
+        ? dimension.coordinateName ? dimension.coordinateValues.indexOf(coordinate) : -1
+        : index;
+      if (matched < 0 || matched >= dimension.size) throw new Error(`Variable ${reference.name} has no ${referenceDimension.name}=${coordinate}.`);
+      return matched;
+    };
+    const fixedComponent = /^(\d+):(\d+)$/.exec(component || '');
+    let values;
+    if (reference.shape.length === 2 && fixedComponent) {
+      const dimensionIndex = Number(fixedComponent[1]);
+      const index = matchingIndex(dimensionIndex, Number(fixedComponent[2]));
+      values = resolveAxis(variable, `${dimensionIndex}:${index}`)?.values;
+    } else {
+      const retained = sliceToRank(reference, 1, sliceIndexes)?.dims.map(dim => dim.name) || [];
+      const matchedSlices = {};
+      reference.dims.forEach((dimension, dimensionIndex) => {
+        if (retained.includes(dimension.name)) return;
+        const index = Math.max(0, Math.min(dimension.size - 1, Number(sliceIndexes[dimension.name]) || 0));
+        matchedSlices[dimension.name] = matchingIndex(dimensionIndex, index);
+      });
+      values = sliceToRank(variable, 1, matchedSlices)?.values;
+    }
+    if (!isPrimitiveArray(values) || !isNumericArray(values)) throw new Error(`Variable ${reference.name} has no numeric series for the selected component or slice.`);
+    return values;
+  }
+
   function rgbImage(variable) {
     if (!variable || !variable.numeric || variable.shape.length !== 3 || variable.shape[0] <= 0 || variable.shape[1] <= 0 || variable.shape[2] !== 3) return null;
     return { values: variable.values, xDimension: variable.dims[1], yDimension: variable.dims[0], label: variable.name };
@@ -248,5 +286,5 @@
     };
   }
 
-  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, imagePlane, rgbImage, preferredImageVariable, defaultPlotMode, imageRenderData, finitePoints, preferredVariable, structureSummary, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
+  return { arrayShape, isNumericArray, buildDataset, axisComponentOptions, resolveAxis, compatibleAxisValues, imagePlane, rgbImage, preferredImageVariable, defaultPlotMode, imageRenderData, finitePoints, preferredVariable, structureSummary, recommendPlot, sliceToRank, downsample, downsampleAligned, reshapeFlat };
 });
