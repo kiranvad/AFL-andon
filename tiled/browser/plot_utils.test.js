@@ -117,3 +117,26 @@ test('keeps 1D variables free of component choices and downsamples aligned axes 
   assert.deepEqual(sampled.values, [[0, 3], [0, 30]]);
   assert.equal(sampled.reduced, true);
 });
+
+test('matching an overlay component rejects a missing label instead of using its ordinal position', () => {
+  const reference = plots.buildDataset({ component: ['A', 'B'], grid: [[1, 2], [3, 4]] }).variables.find(item => item.name === 'grid');
+  const other = plots.buildDataset({ component: ['A', 'C'], grid: [[10, 20], [30, 40]] }).variables.find(item => item.name === 'grid');
+  const component = plots.axisComponentOptions(reference).find(item => item.label === 'B');
+  assert.throws(() => plots.compatibleAxisValues(other, reference, component.value), /has no component=B/);
+});
+
+test('overlay slices match coordinate values across multidimensional entries', () => {
+  const metadata = { structure: { variables: { signal: { dims: ['time', 'row', 'q'], shape: [2, 2, 2] } } } };
+  const reference = plots.buildDataset({ time: [100, 200], row: [0, 1], q: [1, 2], signal: [[[1, 2], [3, 4]], [[5, 6], [7, 8]]] }, metadata).variables.find(item => item.name === 'signal');
+  const other = plots.buildDataset({ time: [200, 100], row: [1, 0], q: [1, 2], signal: [[[70, 80], [50, 60]], [[30, 40], [10, 20]]] }, metadata).variables.find(item => item.name === 'signal');
+  assert.deepEqual(plots.compatibleAxisValues(reference, reference, '', { time: 1, row: 0 }), [5, 6]);
+  assert.deepEqual(plots.compatibleAxisValues(other, reference, '', { time: 1, row: 0 }), [50, 60]);
+});
+
+test('overlay compatibility checks dimensions and rejects nonnumeric selected slices', () => {
+  const reference = plots.buildDataset({ signal: [1, 2] }).variables[0];
+  const differentRank = plots.buildDataset({ signal: [[10, 20]] }).variables[0];
+  const emptySlice = plots.buildDataset({ signal: [[null, null], [10, 20]] }).variables[0];
+  assert.throws(() => plots.compatibleAxisValues(differentRank, reference, 'all'), /different dimensions/);
+  assert.throws(() => plots.compatibleAxisValues(emptySlice, emptySlice, '0:0'), /no numeric series/);
+});

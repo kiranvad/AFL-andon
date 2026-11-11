@@ -35,7 +35,7 @@ function setupDialog() {
   return { notifications, elements, document, copied: () => copied };
 }
 
-function setupRenderer(invoke) {
+function setupRenderer(invoke, options = {}) {
   const { elements, document } = setupDialog();
   const rendererPath = path.resolve(__dirname, '../renderer.js');
   const rendererRequire = createRequire(rendererPath);
@@ -44,21 +44,24 @@ function setupRenderer(invoke) {
   let initialize;
   document.addEventListener = (type, callback) => { if (type === 'DOMContentLoaded') initialize = callback; };
   document.querySelector = selector => selector.includes('.close') ? document.createElement('span') : null;
-  const logger = Object.fromEntries(['info', 'debug', 'error', 'warn'].map(level => [level, () => {}]));
+  const logs = [];
+  const logger = Object.fromEntries(['info', 'debug', 'error', 'warn'].map(level => [level, (...args) => {
+    logs.push({ level, text: args.join(' ') });
+  }]));
   const mocks = {
     electron: { ipcRenderer: { on: (channel, callback) => listeners.set(channel, callback), invoke, send() {} }, clipboard: { writeText() {} } },
     './logger': { createLogger: () => logger, setLogSink() {} },
     '@xterm/xterm': {}, '@xterm/addon-fit': {}, jsoneditor: {}
   };
   const context = vm.createContext({
-    __dirname: path.dirname(rendererPath), document, global: {},
+    __dirname: path.dirname(rendererPath), document, global: { fetch: options.fetch }, AbortController,
     window: { addEventListener: (type, callback) => windowListeners.set(type, callback) },
     setTimeout: () => 0, setInterval: () => 0, clearTimeout() {},
     require: name => mocks[name] || rendererRequire(name)
   });
   vm.runInContext(fs.readFileSync(rendererPath, 'utf8'), context, { filename: rendererPath });
   vm.runInContext("config = { Sulphur: { host: 'sulphur' } }; loadPaths = loadConfig = async () => {}; renderServers = () => {};", context);
-  return { context, elements, listeners, windowListeners, initialize: () => initialize() };
+  return { context, elements, listeners, windowListeners, logs, initialize: () => initialize() };
 }
 
 test('queued errors block through Copy, Escape and backdrop clicks until Clear Errors', () => {
@@ -199,4 +202,68 @@ test('failed server controls use the blocking dialog with the exact returned err
   assert.deepEqual(elements['error-list'].children.map(entry => entry.children[2].textContent), [
     'Exact authentication failure', 'SSH diagnostic output'
   ]);
+});
+
+test('queue health warnings do not block Andon and repeat only after recovery or a changed reason', async () => {
+  const { context, elements, logs, initialize } = setupRenderer(async () => ({ events: [] }));
+  await initialize();
+  vm.runInContext("startedServers.add('Sulphur');", context);
+  elements['Sulphur-http-status'] = {};
+  const screen = { success: true, status: true };
+  const unavailable = { ok: false, state: null, reason: 'Cannot reach queue_state: fetch failed' };
+  context.updateServerStatusUI('Sulphur', screen, unavailable);
+  context.updateServerStatusUI('Sulphur', screen, unavailable);
+  assert.equal(elements['Sulphur-http-status'].textContent, 'SERVER DOWN');
+  assert.equal(elements['Sulphur-http-status'].title, unavailable.reason);
+  assert.equal(logs.filter(entry => entry.level === 'warn').length, 1);
+  context.updateServerStatusUI('Sulphur', screen, { ok: true, state: 'ready' });
+  context.updateServerStatusUI('Sulphur', screen, unavailable);
+  context.updateServerStatusUI('Sulphur', screen, { ...unavailable, reason: 'Request timed out' });
+  assert.equal(logs.filter(entry => entry.level === 'warn').length, 3);
+  assert.equal(logs.some(entry => entry.level === 'error'), false);
+  assert.equal(elements['error-dialog'].open, false);
+  assert.equal(elements['error-list'].children.length, 0);
+});
+
+for (const action of ['start', 'restart']) {
+  test(`${action} with unreachable HTTP remains usable without activating Clear Errors`, async () => {
+    const warning = 'Server process started but HTTP is not reachable at http://localhost:5000/queue_state: fetch failed';
+    const { context, elements, logs, initialize } = setupRenderer(async channel => {
+      if (channel === `${action}-server`) return { success: true, degraded: true, warning, output: 'Server launch output' };
+      if (channel === 'activate-server-log-stream') return { success: true, status: 'connected', chunks: [] };
+      if (channel === 'get-server-status') return { success: true, status: true };
+      return { events: [] };
+    }, { fetch: async () => { throw new Error('fetch failed'); } });
+    await initialize();
+    await context.controlServer('Sulphur', action);
+    assert.equal(vm.runInContext("startedServers.has('Sulphur')", context), true);
+    assert.equal(elements['error-dialog'].open, false);
+    assert.equal(elements['error-list'].children.length, 0);
+    assert.ok(logs.some(entry => entry.level === 'warn' && entry.text.includes(warning)));
+    assert.equal(logs.some(entry => entry.level === 'error'), false);
+  });
+}
+
+test('a rejected Tiled health request becomes a nonblocking queue warning', async () => {
+  const { context, elements, logs, initialize } = setupRenderer(async channel => {
+    if (channel === 'tiled-ping') throw new Error('fetch failed');
+    if (channel === 'get-server-status') return { success: true, status: true };
+    return { events: [] };
+  });
+  await initialize();
+  vm.runInContext("config.Sulphur.server_type = 'tiled'; startedServers.add('Sulphur');", context);
+  await context.updateServerStatus('Sulphur');
+  assert.ok(logs.some(entry => entry.level === 'warn' && entry.text.includes('fetch failed')));
+  assert.equal(logs.some(entry => entry.level === 'error'), false);
+  assert.equal(elements['error-dialog'].open, false);
+});
+
+test('an SSH status error still blocks even when HTTP health is unavailable', async () => {
+  const { context, elements, initialize } = setupRenderer(async () => ({ events: [] }));
+  await initialize();
+  vm.runInContext("startedServers.add('Sulphur');", context);
+  context.updateServerStatusUI('Sulphur', { success: false, error: 'SSH authentication failed' },
+    { ok: false, reason: 'fetch failed' });
+  assert.equal(elements['error-dialog'].open, true);
+  assert.equal(elements['error-list'].children[0].children[2].textContent, 'SSH authentication failed');
 });

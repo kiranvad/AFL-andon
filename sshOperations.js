@@ -816,15 +816,38 @@ class SSHOperations {
   async probeTiledFromDriverHost(serverName, tiledServer, tiledApiKey) {
     const metadataUrl = new URL('api/v1/metadata/', `${tiledServer.replace(/\/$/, '')}/`).toString();
     const authenticated = Boolean(String(tiledApiKey || '').trim());
-    const command = authenticated
+    const curlCommand = authenticated
       ? `IFS= read -r TILED_API_KEY; curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 --header "Authorization: Apikey $TILED_API_KEY" ${shellQuote(metadataUrl)}`
       : `curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 3 ${shellQuote(metadataUrl)}`;
+    const pythonProbe = [
+      'import sys, urllib.error, urllib.request',
+      `api_key = sys.stdin.readline().rstrip('\\r\\n') if ${authenticated ? 'True' : 'False'} else ''`,
+      "headers = {'Authorization': 'Apikey ' + api_key} if api_key else {}",
+      'request = urllib.request.Request(sys.argv[1], headers=headers)',
+      'opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))',
+      'try:',
+      '    with opener.open(request, timeout=3) as response:',
+      '        print(response.status)',
+      'except urllib.error.HTTPError as error:',
+      '    print(error.code)',
+      'except urllib.error.URLError as error:',
+      "    print('Tiled request failed: ' + str(error.reason), file=sys.stderr)",
+      '    sys.exit(1)',
+      'except (OSError, ValueError) as error:',
+      "    print('Tiled request failed: ' + type(error).__name__, file=sys.stderr)",
+      '    sys.exit(1)'
+    ].join('\n');
+    const command = `if command -v curl >/dev/null 2>&1; then ${curlCommand}; ` +
+      `elif command -v python3 >/dev/null 2>&1; then python3 -c ${shellQuote(pythonProbe)} ${shellQuote(metadataUrl)}; ` +
+      "else printf '%s\\n' 'Neither curl nor python3 is available for the Tiled pre-launch check.' >&2; exit 127; fi";
     const result = await this.executeCommand(serverName, command, 5000,
       { quiet: true, ...(authenticated ? { stdin: `${tiledApiKey}\n` } : {}) });
-    const statusCode = String(result.output || '').trim().match(/\d{3}$/)?.[0];
+    const output = String(result.output || '').trim();
+    const statusCode = output.match(/(?:^|\n)([1-5]\d{2})$/)?.[1];
     if (!result.success || result.code !== 0 || !statusCode || Number(statusCode) < 200 || Number(statusCode) >= 300) {
       return { success: false, error: result.error ||
-        (statusCode ? `Tiled returned HTTP ${statusCode}` : 'Tiled did not return an HTTP status') };
+        (statusCode ? `Tiled returned HTTP ${statusCode}` :
+          output ? `Tiled probe failed: ${output}` : 'Tiled did not return an HTTP status') };
     }
     return { success: true, metadataUrl, statusCode: Number(statusCode) };
   }

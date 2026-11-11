@@ -37,9 +37,14 @@ Andon session are not polled, including active external or NAS profiles loaded
 from configuration. A failed SSH check displays **SSH DOWN**; an
 unreachable HTTP endpoint displays **SERVER DOWN**. Server cards and sidebar
 buttons use green for active, yellow for paused, and red for down.
+An unavailable queue-state or HTTP health endpoint is logged as a warning and
+does not open the error dialog. A live server process whose HTTP endpoint is
+not ready after Start or Restart also remains accessible with a warning.
+Repeated queue-health warnings are logged once until the endpoint recovers or
+the failure reason changes.
 
 Reported errors open a blocking dialog with the affected server and the exact
-error text. This includes failed server commands, HTTP health failures, Andon
+error text. This includes failed server commands, SSH failures, Andon
 application errors, and Python tracebacks or error-level messages in live server
 output, including during startup. **Copy Errors** copies all displayed errors
 and server names to the clipboard. **Clear Errors** acknowledges them and returns
@@ -154,7 +159,9 @@ control computer forwards traffic to the selected Tiled service. This works
 when the control computer can reach Tiled but the driver host cannot. After
 reopening Andon, it discovers a healthy enabled Tiled card, preferring a card
 named **tiled**. Before launch, Andon verifies authenticated Tiled access from
-the driver's SSH account through the selected endpoint or tunnel. The native Tiled
+the driver's SSH account through the selected endpoint or tunnel. This check
+uses `curl` when available and otherwise uses Python 3's standard library.
+Failed checks report the HTTP status or connection error. The native Tiled
 browser may also read the latest `tiled_api_key` from that global file as a
 credential fallback when its selected Tiled YAML does not define a key.
 
@@ -291,6 +298,16 @@ appear in the table; **Select** and **Actions** always remain visible, and the
 column choices are saved locally. Filter choices are read from Tiled's
 distinct-metadata endpoint; selecting **Data** or **Metadata** on an entry
 reads only that entry. These are read-only requests.
+
+Select multiple entries and click **Plot Selected** to compare their data in
+one plot window. **Overlay compatible datasets** is enabled automatically for
+Line 1D, Scatter 2D, and Scatter 3D. Choose a reference dataset under **Axes from
+dataset**, then set the shared axis variables and components. Each compatible
+entry appears as a separate trace in the legend; click a legend item to hide
+or show it. Entries can have different point counts and X coordinates. Labeled
+components are matched by value, and entries missing the chosen axes are
+reported as skipped. Turn off overlay to view individual entries. Image,
+Heatmap, and Contourf plots show the selected entry individually.
 
 For a locally managed profile, Andon reads
 `authentication.single_user_api_key`. For an external profile, it reads the
