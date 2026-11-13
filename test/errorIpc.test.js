@@ -40,6 +40,7 @@ async function setup(options = {}) {
       this.config = options.config || { Sulphur: { host: 'sulphur' }, worker: { host: 'worker' } };
     }
     async initialize() {}
+    async prepareTiledServer() {}
     async getServerLogSize() { return { success: true, size: 0 }; }
     async streamServerLog(name, offset, callbacks) {
       streamCallbacks.set(name, callbacks);

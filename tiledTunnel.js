@@ -14,6 +14,7 @@ class TiledTunnel {
     this.serverNames = new Set();
     this.port = 0;
     this.conn = null;
+    this.connectingConn = null;
     this.pending = null;
     this.closed = false;
     this.retryTimer = null;
@@ -45,6 +46,7 @@ class TiledTunnel {
 
   async open() {
     const { conn } = await this.connect();
+    this.connectingConn = conn;
     let disconnected = false;
     let assignedPort = this.port;
     conn.on('error', () => {}); // The authentication layer also reports errors.
@@ -66,9 +68,12 @@ class TiledTunnel {
     try {
       if (this.closed) throw new Error('Tiled tunnel was closed during connection.');
       assignedPort = await new Promise((resolve, reject) => {
+        let settled = false;
         const timer = setTimeout(() => finish(new Error('SSH Tiled forwarding request timed out.')), 5000);
         const onClose = () => finish(new Error('SSH disconnected while establishing the Tiled tunnel.'));
         const finish = (error, port) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           conn.removeListener('close', onClose);
           if (error) reject(error);
@@ -90,11 +95,14 @@ class TiledTunnel {
       if (this.closed || disconnected) throw new Error('SSH Tiled tunnel closed during startup.');
       this.port = assignedPort;
       this.conn = conn;
+      this.connectingConn = null;
       this.retryAttempt = 0;
       this.log.info(`Tiled tunnel ready at ${this.url.origin} via the control computer to ${this.target.origin}`);
       return this.url;
     } catch (error) {
-      conn.end();
+      if (this.connectingConn === conn) this.connectingConn = null;
+      if (typeof conn.destroy === 'function') conn.destroy();
+      else conn.end();
       throw new Error(`Could not establish an SSH Tiled tunnel: ${error.message}. Check that the driver host permits remote TCP forwarding.`);
     }
   }
@@ -151,8 +159,12 @@ class TiledTunnel {
     clearTimeout(this.retryTimer);
     this.retryTimer = null;
     this.destroyStreams();
-    this.conn?.end();
+    for (const conn of new Set([this.conn, this.connectingConn])) {
+      if (typeof conn?.destroy === 'function') conn.destroy();
+      else conn?.end();
+    }
     this.conn = null;
+    this.connectingConn = null;
   }
 }
 

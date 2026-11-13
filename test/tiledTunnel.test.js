@@ -166,3 +166,20 @@ test('closing a tunnel while SSH is connecting cancels setup without leaving a f
   await assert.rejects(ready, /closed during connection/);
   assert.equal(ended, true);
 });
+
+test('closing while a forwarding request is pending destroys SSH immediately', async () => {
+  let destroyed = false;
+  const conn = Object.assign(new EventEmitter(), {
+    end() {},
+    destroy() { destroyed = true; this.emit('close'); },
+    forwardIn() {}
+  });
+  const tunnel = new TiledTunnel({ connect: async () => ({ conn }), targetUrl: 'http://tiled.example:8000', log });
+  const ready = tunnel.ensureReady();
+  await Promise.resolve();
+  tunnel.close();
+  await assert.rejects(ready, /disconnected|closed/i);
+  assert.equal(destroyed, true);
+  assert.equal(tunnel.connectingConn, null);
+  assert.equal(tunnel.retryTimer, null);
+});

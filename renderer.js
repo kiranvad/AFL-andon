@@ -1240,6 +1240,12 @@ function updateServerTypeFields() {
   document.getElementById('ssh-authentication-group').style.display = 'block';
   configInput.required = isTiled;
   configInput.placeholder = isTiled ? '/path/to/tiled_config.yml' : '/path/to/server-config.json';
+  for (const id of ['server-http-port', 'server-status-url', 'server-webview-url']) {
+    const input = document.getElementById(id);
+    input.closest('.form-group').style.display = isTiled ? 'none' : 'block';
+    input.disabled = isTiled;
+  }
+  document.getElementById('server-http-port').required = !isTiled;
   document.getElementById('server-shell').closest('.form-group').style.display = isTiled ? 'none' : 'block';
   document.getElementById('server-env-type').closest('.form-group').style.display = 'block';
   document.getElementById('conda-group').style.display = document.getElementById('server-env-type').value === 'conda' ? 'block' : 'none';
@@ -1257,6 +1263,22 @@ async function browseServerScript() {
   const input = document.getElementById('server-script');
   input.value = result.filePaths[0];
   input.dataset.localFile = input.value;
+}
+
+async function browseServerConfig() {
+  const isTiled = document.getElementById('server-type').value === 'tiled';
+  const result = await ipcRenderer.invoke('show-open-dialog', {
+    title: isTiled ? 'Select Tiled configuration' : 'Select server configuration',
+    properties: ['openFile'],
+    filters: [
+      isTiled ? { name: 'YAML files', extensions: ['yml', 'yaml'] }
+        : { name: 'Configuration files', extensions: ['json', 'yml', 'yaml'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  });
+  if (result.canceled || !result.filePaths?.length) return;
+  document.getElementById('server-config-file-location').value = result.filePaths[0];
+  updateConfigLocationOptions();
 }
 
 function updateEnvTypeFields() {
@@ -1289,6 +1311,7 @@ async function handleServerFormSubmit(event) {
     serverConfig.server_script = '';
     serverConfig.script_file_location = '';
     serverConfig.shell = 'bash';
+    delete serverConfig.httpPort;
   } else if (serverType === 'script') {
     serverConfig.server_type = 'script';
     serverConfig.server_module = '';
@@ -1326,11 +1349,11 @@ async function handleServerFormSubmit(event) {
   }
 
   const statusUrl = form.elements['server-status-url'].value;
-  if (statusUrl) {
+  if (serverType !== 'tiled' && statusUrl) {
     serverConfig.status_url = statusUrl;
   }
   const webviewUrl = form.elements['server-webview-url'].value;
-  if (webviewUrl) {
+  if (serverType !== 'tiled' && webviewUrl) {
     serverConfig.webview_url = webviewUrl;
   }
 
@@ -1555,6 +1578,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // document.getElementById('import-ssh-key-btn').addEventListener('click', importSSHKey);
   document.getElementById('server-type').addEventListener('change', updateServerTypeFields);
   document.getElementById('browse-server-script').addEventListener('click', browseServerScript);
+  document.getElementById('browse-server-config').addEventListener('click', browseServerConfig);
   document.getElementById('server-env-type').addEventListener('change', updateEnvTypeFields);
   document.getElementById('set-config-path-btn').addEventListener('click', setConfigPath);
   document.getElementById('save-config-btn').addEventListener('click', saveConfig);

@@ -81,6 +81,10 @@ async function loadTiledProfile(profilePath, options = {}) {
   }
 
   const management = normalizeManagement(profile, external ? 'external' : 'local', profilePath);
+  const port = profile.uvicorn?.port == null ? (external ? null : 8000) : Number(profile.uvicorn.port);
+  if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error(`Tiled profile ${profilePath} uvicorn.port must be an integer between 1 and 65535.`);
+  }
   let uri = '';
   if (external) {
     const derivedUri = explicitUri ||
@@ -94,7 +98,29 @@ async function loadTiledProfile(profilePath, options = {}) {
     apiKey,
     management,
     catalogPath: String(profile.catalog_path || '').trim().replace(/^\/+|\/+$/g, ''),
-    structureClients: profile.structure_clients || 'dask'
+    structureClients: profile.structure_clients || 'dask',
+    port
+  };
+}
+
+function getTiledConnection(server, profile) {
+  let endpoint;
+  let httpPort;
+  if (profile.mode === 'external') {
+    endpoint = new URL(profile.uri);
+    httpPort = Number(endpoint.port) || (endpoint.protocol === 'https:' ? 443 : 80);
+  } else {
+    // Old proxy cards may have chosen a separate local port before YAML-based
+    // editing. An explicit uvicorn.port overrides that legacy value.
+    httpPort = profile.port ?? (profile.mode === 'proxy' ?
+      (server.httpPort || Number(new URL(profile.uri).port) || 8000) : 8000);
+    const host = String(server.host || 'localhost').replace(/^\[|\]$/g, '');
+    endpoint = new URL(`http://${host.includes(':') ? `[${host}]` : host}:${httpPort}/`);
+  }
+  return {
+    httpPort,
+    status_url: new URL('healthz', endpoint).toString(),
+    webview_url: endpoint.toString()
   };
 }
 
@@ -102,4 +128,4 @@ function isTiledProxy(server) {
   return server?.server_type === 'tiled' && server.tiled_management?.type === 'afl_proxy';
 }
 
-module.exports = { loadTiledProfile, normalizeHttpUrl, normalizeManagement, isTiledProxy };
+module.exports = { loadTiledProfile, getTiledConnection, normalizeHttpUrl, normalizeManagement, isTiledProxy };

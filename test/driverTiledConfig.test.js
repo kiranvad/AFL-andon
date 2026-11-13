@@ -179,6 +179,9 @@ test('disconnecting the current NAS Tiled clears its session selection', async t
 
 test('drivers sharing an account reuse the tunnel until the last driver stops', async t => {
   const { operations, forwards } = await setup(t);
+  operations.runServerStop = async () => ({
+    success: true, code: 0, output: '{"success":true,"verified":true}'
+  });
   operations.config.second = { ...operations.config.worker };
   const url = new URL('http://tiled.example:8000');
   const first = await operations.ensureTiledTunnel('worker', url);
@@ -190,6 +193,50 @@ test('drivers sharing an account reuse the tunnel until the last driver stops', 
   operations.releaseTiledTunnels('second');
   assert.equal(first.tunnel.closed, true);
   assert.equal(operations.tiledTunnels.size, 0);
+});
+
+for (const stoppedName of ['worker', 'tiled']) {
+  test(`Stop on ${stoppedName} cancels pending Tiled forwarding and releases its transport`, { timeout: 5000 }, async t => {
+    const { operations, files, globalPath } = await setup(t);
+    const original = files.get(globalPath);
+    operations.runServerStop = async () => ({ success: true, code: 0,
+      output: '{"success":true,"verified":true}' });
+    let forwarding;
+    const requested = new Promise(resolve => { forwarding = resolve; });
+    let destroyed = false;
+    let complete;
+    operations.connectWithAvailableKeys = async () => ({ conn: Object.assign(new EventEmitter(), {
+      end() {},
+      destroy() { destroyed = true; this.emit('close'); },
+      forwardIn(_address, _port, callback) { complete = callback; forwarding(); }
+    }) });
+    const pending = operations.configureTiledForLaunch('worker');
+    const canceled = assert.rejects(pending, /canceled|closed|disconnected/i);
+    await requested;
+    assert.equal((await operations.stopServer(stoppedName)).success, true);
+    // Even a late successful forwarding callback must not revive the tunnel.
+    complete(null, 38123);
+    await canceled;
+    assert.equal(destroyed, true);
+    assert.equal(operations.tiledTunnels.size, 0);
+    assert.equal(operations.tiledTunnelSources.size, 0);
+    assert.equal(files.get(globalPath), original);
+  });
+}
+
+test('Stop during Tiled discovery prevents a late health result from selecting it again', async t => {
+  const { operations } = await setup(t);
+  operations.runServerStop = async () => ({ success: true, code: 0,
+    output: '{"success":true,"verified":true}' });
+  let complete;
+  operations.probeServerHealth = () => new Promise(resolve => { complete = resolve; });
+  operations.activateTiledForSession = () => assert.fail('stopped Tiled must not be activated');
+  const pending = operations.discoverActiveTiledConnection();
+  await operations.stopServer('tiled');
+  complete({ ok: true });
+  assert.equal(await pending, null);
+  assert.equal(operations.activeTiledServerName, null);
+  assert.equal(operations.activeTiledConnection, null);
 });
 
 test('switching Tiled for one driver preserves the previous service for other drivers', async t => {

@@ -4,11 +4,12 @@ const path = require('path');
 const os = require('os');
 const { isIP } = require('node:net');
 const { createLogger } = require('./logger');
-const { loadTiledProfile, isTiledProxy } = require('./tiled/profile');
+const { loadTiledProfile, getTiledConnection, isTiledProxy } = require('./tiled/profile');
 const { appendAflTiledConfig, updateAflTiledConfig } = require('./aflGlobalConfig');
 const { getSshAuthentication, getSshCredentialId } = require('./sshAuthentication');
 const TiledTunnel = require('./tiledTunnel');
 const { ensureLauncherConfig } = require('./configBootstrap');
+const { workerSource, STOP_TIMEOUT_MS, parseStopResult, runLocalStop } = require('./serverStop');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
@@ -76,6 +77,10 @@ class SSHOperations {
     this.hostOsCache = {}; // Cache for remote OS detection (darwin vs linux)
     this.tiledConfigUpdates = new Map();
     this.tiledTunnels = new Map();
+    this.tiledTunnelSources = new Map();
+    this.localStop = options.localStop || runLocalStop;
+    this.stoppedServers = new Set();
+    this.stopVersions = new Map();
     this.activeTiledServerName = null;
     this.activeTiledConnection = null;
     log.debug(`SSHOperations created with configPath=${configPath}, sshKeyPath=${sshKeyPath}`);
@@ -103,7 +108,7 @@ class SSHOperations {
       
       // Set default values if not specified
       this.getServerEntries().forEach(([serverName, server]) => {
-        if (!server.httpPort) {
+        if (!server.httpPort && server.server_type !== 'tiled') {
           server.httpPort = 5000;
           log.debug(`${serverName}: Using default httpPort 5000`);
         }
@@ -146,6 +151,7 @@ class SSHOperations {
           } else {
             delete server.tiled_profile_uri;
           }
+          Object.assign(server, getTiledConnection(server, profile));
         } catch (error) {
           log.warn(`${serverName}: Could not inspect Tiled profile: ${error.message}`);
         }
@@ -171,6 +177,21 @@ class SSHOperations {
       log.error(`Failed to save config to ${this.configPath}:`, error.message);
       throw error;
     }
+  }
+
+  async prepareTiledServer(server) {
+    if (server.server_type !== 'tiled') return;
+    if (!server.config_file_location) throw new Error('Tiled requires a config file location.');
+    const profile = await loadTiledProfile(server.config_file_location, { loadApiKey: false });
+    server.external_service = profile.mode === 'external';
+    server.tiled_management = profile.management;
+    if (profile.mode === 'external') server.tiled_profile_uri = profile.uri;
+    else delete server.tiled_profile_uri;
+    if (profile.management.type === 'docker_compose') {
+      server.host = profile.management.host;
+      server.username = profile.management.username;
+    }
+    Object.assign(server, getTiledConnection(server, profile));
   }
 
   async loadSSHKey({ quiet = false } = {}) {
@@ -517,11 +538,36 @@ class SSHOperations {
     }
 
     return new Promise((resolve) => {
+      let settled = false;
+      let timer;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        conn.removeListener('close', onClose);
+        conn.removeListener('error', onError);
+        conn.end();
+        resolve(result);
+      };
+      const onClose = () => finish({ success: false, sshDown: true,
+        error: 'SSH disconnected before the command completed.' });
+      const onError = error => finish({ success: false, sshDown: true, error: error.message });
+      conn.once('close', onClose);
+      conn.once('error', onError);
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          finish({ success: false, sshDown: true, error: `SSH command timed out after ${timeout}ms.` });
+          conn.destroy();
+        }, timeout);
+      }
       const onExec = (err, stream) => {
+        if (settled) {
+          stream?.close();
+          return;
+        }
         if (err) {
           if (!options.quiet) log.error(`${serverName}: Command execution failed:`, err.message);
-          conn.end();
-          resolve({ success: false, sshDown: true, error: err.message });
+          finish({ success: false, sshDown: true, error: err.message });
           return;
         }
 
@@ -529,24 +575,31 @@ class SSHOperations {
 
         let output = '';
         stream.on('close', (code, signal) => {
-          conn.end();
           log.debug(`${serverName}: Command finished with code=${code}, signal=${signal}`);
           // Don't warn for screen -ls returning code 1 (means "no screens found" - expected)
           const isScreenLsNoScreens = command === 'screen -ls' && code === 1;
           if (code !== 0 && code !== null && !isScreenLsNoScreens && !options.quiet) {
             log.warn(`${serverName}: Command exited with non-zero code ${code}`);
           }
-          resolve({ success: true, output, code, signal });
+          finish({ success: true, output, code, signal });
           log.debug(`${serverName}: Output length: ${output.length} bytes`);
-        }).on('data', (data) => {
+        }).on('error', onError).on('data', (data) => {
           output += data;
         }).stderr.on('data', (data) => {
           output += data;
           log.debug(`${serverName}: stderr: ${data.toString().trim()}`);
         });
       };
-      if (options.pty) conn.exec(command, { pty: true }, onExec);
-      else conn.exec(command, onExec);
+      try {
+        if (options.isCanceled?.()) {
+          finish({ success: false, canceled: true, error: 'Server launch was canceled by Stop.' });
+          return;
+        }
+        if (options.pty) conn.exec(command, { pty: true }, onExec);
+        else conn.exec(command, onExec);
+      } catch (error) {
+        finish({ success: false, error: error.message });
+      }
     });
   }
 
@@ -671,14 +724,23 @@ class SSHOperations {
   async activateTiledForSession(serverName) {
     const serverConfig = this.config[serverName];
     if (serverConfig?.server_type !== 'tiled') return null;
+    const version = this.stopVersions.get(serverName) || 0;
+    const checkStopped = () => {
+      if (this.stoppedServers.has(serverName) || version !== (this.stopVersions.get(serverName) || 0)) {
+        throw new Error('Tiled activation was canceled by Stop.');
+      }
+    };
+    checkStopped();
 
     const profile = await loadTiledProfile(serverConfig.config_file_location);
+    checkStopped();
     const tiledServer = this.getTiledApiBaseUrl(serverName, profile);
     const result = await updateAflTiledConfig(
       this.aflGlobalConfigPath,
       tiledServer,
       profile.apiKey
     );
+    checkStopped();
     this.activeTiledServerName = serverName;
     this.activeTiledConnection = {
       serverName,
@@ -691,9 +753,19 @@ class SSHOperations {
 
   async configureTiledForLaunch(serverName) {
     const serverConfig = this.config[serverName];
+    const driverVersion = this.stopVersions.get(serverName) || 0;
     const active = await this.discoverActiveTiledConnection();
     if (!active) return null;
     const tiledName = active.serverName;
+    const tiledVersion = this.stopVersions.get(tiledName) || 0;
+    const checkStopped = () => {
+      if (this.stoppedServers.has(serverName) || this.stoppedServers.has(tiledName) ||
+          driverVersion !== (this.stopVersions.get(serverName) || 0) ||
+          tiledVersion !== (this.stopVersions.get(tiledName) || 0)) {
+        throw new Error('Tiled connection setup was canceled by Stop.');
+      }
+    };
+    checkStopped();
     const tiledConfig = this.config[tiledName];
     let tiledApiKey = active.tiledApiKey;
     let url = new URL(active.tiledServer);
@@ -722,16 +794,19 @@ class SSHOperations {
       let tunnel;
       let addedOwner = false;
       try {
+        checkStopped();
         if (!isLocalHost(serverConfig.host) && url.protocol === 'http:') {
-          ({ tunnel, addedOwner } = await this.ensureTiledTunnel(serverName, url));
+          ({ tunnel, addedOwner } = await this.ensureTiledTunnel(serverName, url, tiledName));
           url = tunnel.url;
         }
+        checkStopped();
         // Verify the endpoint the driver will actually use, including the
         // reverse tunnel, before changing config or starting its process.
         const reachable = await this.probeTiledFromDriverHost(serverName, url.toString(), tiledApiKey);
         if (!reachable.success) {
           throw new Error(`Tiled connection failed before launch; address ${url}: ${reachable.error}`);
         }
+        checkStopped();
         if (localAccount) {
           await updateAflTiledConfig(this.aflGlobalConfigPath, url.toString(), tiledApiKey);
         } else {
@@ -743,12 +818,15 @@ class SSHOperations {
           }
           const config = current.success ? JSON.parse(current.data) : {};
           const result = appendAflTiledConfig(config, url.toString(), tiledApiKey);
+          checkStopped();
           const saved = await this.writeRemoteFile(
             serverConfig.host, remotePath, `${JSON.stringify(result.config, null, 4)}\n`, serverName, { mode: 0o600, atomic: true }
           );
           if (!saved.success) throw new Error(`Could not update remote AFL global config: ${saved.error}`);
         }
+        checkStopped();
         this.releaseTiledTunnels(serverName, tunnel);
+        if (tunnel) this.tiledTunnelSources.set(serverName, tiledName);
       } catch (error) {
         if (addedOwner) this.releaseTiledTunnelOwner(tunnel, serverName);
         throw error;
@@ -770,10 +848,14 @@ class SSHOperations {
   async discoverActiveTiledConnection() {
     if (this.activeTiledServerName && this.activeTiledConnection?.serverName !== this.activeTiledServerName &&
         this.config[this.activeTiledServerName]?.server_type === 'tiled') {
-      const profile = await loadTiledProfile(this.config[this.activeTiledServerName].config_file_location);
+      const serverName = this.activeTiledServerName;
+      const version = this.stopVersions.get(serverName) || 0;
+      const profile = await loadTiledProfile(this.config[serverName].config_file_location);
+      if (this.stoppedServers.has(serverName) || version !== (this.stopVersions.get(serverName) || 0) ||
+          this.activeTiledServerName !== serverName) return null;
       this.activeTiledConnection = {
-        serverName: this.activeTiledServerName,
-        tiledServer: this.getTiledApiBaseUrl(this.activeTiledServerName, profile),
+        serverName,
+        tiledServer: this.getTiledApiBaseUrl(serverName, profile),
         tiledApiKey: profile.apiKey
       };
       return this.activeTiledConnection;
@@ -781,13 +863,15 @@ class SSHOperations {
     if (this.activeTiledConnection) return this.activeTiledConnection;
     const tiledServers = this.getServerEntries().filter(([, server]) =>
       server.server_type === 'tiled' && server.active !== false
-    ).map(([name]) => name);
+    ).map(([name]) => name).filter(name => !this.stoppedServers.has(name));
     // Prefer the conventional card after reopening, then discover any other
     // enabled Tiled service. Explicit session selection wins.
     tiledServers.sort((a, b) => Number(b.trim().toLowerCase() === 'tiled') - Number(a.trim().toLowerCase() === 'tiled'));
     for (const tiledName of tiledServers) {
+      const version = this.stopVersions.get(tiledName) || 0;
       const health = await this.probeServerHealth(tiledName);
-      if (!health.ok) continue;
+      if (!health.ok || this.stoppedServers.has(tiledName) ||
+          version !== (this.stopVersions.get(tiledName) || 0)) continue;
       try {
         await this.activateTiledForSession(tiledName);
         return this.activeTiledConnection;
@@ -863,7 +947,7 @@ class SSHOperations {
     if (this.activeTiledConnection?.serverName === serverName) this.activeTiledConnection = null;
   }
 
-  async ensureTiledTunnel(serverName, url) {
+  async ensureTiledTunnel(serverName, url, tiledName) {
     const account = this.getCredentialId(serverName);
     const key = JSON.stringify([account, url.origin]);
     let tunnel = this.tiledTunnels.get(key);
@@ -881,6 +965,9 @@ class SSHOperations {
     }
     const addedOwner = !tunnel.serverNames.has(serverName);
     tunnel.serverNames.add(serverName);
+    if (tiledName && !this.tiledTunnelSources.has(serverName)) {
+      this.tiledTunnelSources.set(serverName, tiledName);
+    }
     try {
       await tunnel.ensureReady();
       return { tunnel, addedOwner };
@@ -892,6 +979,9 @@ class SSHOperations {
 
   releaseTiledTunnelOwner(tunnel, serverName) {
     tunnel.serverNames.delete(serverName);
+    if (![...this.tiledTunnels.values()].some(current => current.serverNames.has(serverName))) {
+      this.tiledTunnelSources.delete(serverName);
+    }
     if (tunnel.serverNames.size) return;
     tunnel.close();
     for (const [key, current] of this.tiledTunnels) {
@@ -908,6 +998,18 @@ class SSHOperations {
   closeTiledTunnels() {
     for (const tunnel of this.tiledTunnels.values()) tunnel.close();
     this.tiledTunnels.clear();
+    this.tiledTunnelSources.clear();
+  }
+
+  releaseServerConnections(serverName) {
+    this.releaseTiledTunnels(serverName);
+    // Tiled cards own the service selection; their tunnels are held by driver
+    // names. Stopping the source must release those owners too.
+    for (const [driverName, tiledName] of this.tiledTunnelSources) {
+      if (tiledName === serverName) this.releaseTiledTunnels(driverName);
+    }
+    this.clearActiveTiledConnection(serverName);
+    delete this.screenSessionCache[this.getCredentialId(serverName)];
   }
 
   async ensureScreenDetached(serverName) {
@@ -1087,11 +1189,20 @@ class SSHOperations {
 
   async startServer(serverName, options = {}) {
     log.info(`Starting server: ${serverName}`);
+    this.stoppedServers.delete(serverName);
+    const version = this.stopVersions.get(serverName) || 0;
+    const isCanceled = () => this.stoppedServers.has(serverName) ||
+      version !== (this.stopVersions.get(serverName) || 0);
     const serverConfig = this.config[serverName];
     
     if (!serverConfig) {
       log.error(`Cannot start server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
+    }
+    try {
+      if (serverConfig.config_file_location) await this.prepareTiledServer(serverConfig);
+    } catch (error) {
+      return { success: false, error: error.message };
     }
     if (this.isDockerComposeManaged(serverConfig)) {
       let launchContext;
@@ -1257,9 +1368,17 @@ class SSHOperations {
       launchContext = await options.onBeforeLaunch();
     }
 
+    if (isCanceled()) return { success: false, canceled: true, error: 'Server launch was canceled by Stop.' };
     log.info(`${serverName}: Executing start command`);
     log.debug(`${serverName}: Command: ${startCommand}`);
-    const result = await this.executeCommand(serverName, startCommand);
+    const result = await this.executeCommand(serverName, startCommand, 10000, { isCanceled });
+    if (isCanceled()) {
+      // A command already sent over SSH may have launched after the first
+      // cleanup snapshot. Verify cleanup again before completing this launch.
+      const cleanup = await this.stopServer(serverName);
+      return { ...cleanup, success: false, canceled: true,
+        error: cleanup.success ? 'Server launch was canceled by Stop.' : cleanup.error };
+    }
     
     if (!result.success) {
       log.error(`${serverName}: Failed to start server - SSH connection failed`);
@@ -1361,6 +1480,67 @@ class SSHOperations {
     return { ...result, health };
   }
 
+  getServerStopSpec(serverName) {
+    const server = this.config[serverName];
+    const safeName = serverName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const paths = [];
+    if (server.config_file_location) {
+      paths.push(isLocalHost(server.host) ? server.config_file_location :
+        `~/.afl/configs/${safeName}.launch-config${path.extname(server.config_file_location)}`);
+    }
+    if (server.script_file_location) {
+      paths.push(`~/.afl/scripts/${safeName}.launch-script${path.extname(server.script_file_location) || '.sh'}`);
+    } else if (server.server_script && !/[\s;&|]/.test(server.server_script)) {
+      paths.push(server.server_script);
+    }
+    return {
+      screenName: server.screen_name,
+      module: server.server_module || (isTiledProxy(server) ? 'AFL.automation.shared.TiledProxyDriver' : ''),
+      port: server.httpPort,
+      kind: server.server_type === 'tiled' ? 'tiled' : 'script',
+      paths
+    };
+  }
+
+  runServerStop(serverName, spec) {
+    const server = this.config[serverName];
+    const python = server.env_type === 'pip' && server.virtualenv_path
+      ? path.posix.join(server.virtualenv_path, 'bin', 'python') : 'python3';
+    if (process.platform !== 'win32' && isLocalHost(server.host) &&
+        (!server.username || server.username === os.userInfo().username)) {
+      // Spawn before the first await: local cleanup must not depend on an SSH
+      // handshake completing while the launching terminal is shutting down.
+      return this.localStop(spec, python);
+    }
+    const invocation = `${shellQuote(python)} -c ${shellQuote(workerSource)} ${shellQuote(JSON.stringify(spec))}`;
+    // SSH may disconnect during GUI shutdown. Once started, nohup lets this
+    // bounded worker complete independently of the SSH channel.
+    return this.executeCommand(serverName, `nohup ${invocation}`, STOP_TIMEOUT_MS);
+  }
+
+  beginLocalShutdown(serverNames) {
+    const localNames = serverNames.filter(name => {
+      const server = this.config[name];
+      return process.platform !== 'win32' && server && !server.external_service &&
+        !this.isDockerComposeManaged(server) && isLocalHost(server.host) &&
+        (!server.username || server.username === os.userInfo().username);
+    });
+    if (!localNames.length) return;
+    const isTiled = name => this.config[name].server_type === 'tiled';
+    const groups = [localNames.filter(name => !isTiled(name)), localNames.filter(isTiled)]
+      .map(names => names.map(name => ({ name, spec: this.getServerStopSpec(name) })));
+    const first = this.config[localNames[0]];
+    const python = first.env_type === 'pip' && first.virtualenv_path
+      ? path.posix.join(first.virtualenv_path, 'bin', 'python') : 'python3';
+    // Queue a fallback before the first await. Normal shutdown still controls
+    // the order across local and remote drivers. If the terminal kills Andon
+    // before its later Tiled phase, this worker finishes local cleanup.
+    this.localStop({ watchParent: process.pid, groups }, python, undefined, 90000)
+      .then(result => {
+        if (!result.success || result.code !== 0) log.error('Local shutdown fallback failed:', result.error || result.output);
+      }).catch(error => log.error('Local shutdown fallback failed:', error.message));
+  }
+
   async stopServer(serverName) {
     log.info(`Stopping server: ${serverName}`);
     const serverConfig = this.config[serverName];
@@ -1369,11 +1549,13 @@ class SSHOperations {
       log.error(`Cannot stop server: ${serverName} not found in config`);
       return { success: false, error: 'Server not found' };
     }
+    this.stoppedServers.add(serverName);
+    this.stopVersions.set(serverName, (this.stopVersions.get(serverName) || 0) + 1);
     if (this.isDockerComposeManaged(serverConfig)) {
       // A NAS-hosted Tiled service is shared infrastructure. Stop means
       // disconnect this Andon session; it must not stop or alter the remote
       // Docker Compose service.
-      this.clearActiveTiledConnection(serverName);
+      this.releaseServerConnections(serverName);
       return {
         success: true,
         disconnected: true,
@@ -1383,52 +1565,23 @@ class SSHOperations {
       };
     }
     if (serverConfig.external_service) {
+      this.releaseServerConnections(serverName);
       return { success: false, external: true, error: 'This Tiled profile does not define a management backend.' };
     }
     
-    // Build a more robust stop command that:
-    // 1. Sends Ctrl+C to the screen session to gracefully stop the process
-    // 2. Waits briefly for graceful shutdown
-    // 3. Kills any remaining python processes running the server module
-    // 4. Quits the screen session
-    
-    let stopCommands = [];
-    
-    const remoteOs = await this.getRemoteOs(serverName);
-    const isMacOs = remoteOs === 'darwin';
-    log.debug(`${serverName}: Remote OS is ${remoteOs}, isMacOs=${isMacOs}`);
-    
-    const ctrlCCommand = isMacOs
-      ? `screen -S ${serverConfig.screen_name} -p 0 -X stuff $'\\003'`
-      : `screen -X -S ${serverConfig.screen_name} stuff $'\\003'`;
-    
-    // First, try to send Ctrl+C (SIGINT) to gracefully stop the server
-    stopCommands.push(ctrlCCommand);
-    
-    // Wait a moment for graceful shutdown
-    stopCommands.push('sleep 1');
-    
-    // Kill any python processes running this specific module (if server_module is set)
-    if (serverConfig.server_module) {
-      // Use pkill to find and kill python processes running this module
-      // The -f flag matches against the full command line
-      const modulePattern = serverConfig.server_module.replace(/\./g, '\\.');
-      stopCommands.push(`pkill -f "python.*${modulePattern}" 2>/dev/null || true`);
-      log.debug(`${serverName}: Will kill processes matching: python.*${modulePattern}`);
+    let result;
+    try {
+      result = parseStopResult(await this.runServerStop(serverName, this.getServerStopSpec(serverName)));
+    } catch (error) {
+      result = { success: false, error: error.message };
+    } finally {
+      // Release forwards and reconnect timers even if SSH or process cleanup
+      // fails. The failed result retains the card for a subsequent Stop retry.
+      this.releaseServerConnections(serverName);
     }
-    
-    // Finally, quit the screen session (ignore errors if already dead)
-    stopCommands.push(`screen -X -S ${serverConfig.screen_name} quit 2>/dev/null || true`);
-    
-    const stopCommand = stopCommands.join('; ');
-    log.debug(`${serverName}: Executing stop command: ${stopCommand}`);
-    
-    const result = await this.executeCommand(serverName, stopCommand);
-    
     if (result.success) {
-      this.clearActiveTiledConnection(serverName);
-      this.releaseTiledTunnels(serverName);
-      log.info(`${serverName}: Server stopped successfully`);
+      log.info(`${serverName}: Server shutdown verified`);
+      if (result.warning) log.warn(`${serverName}: ${result.warning}`);
       const runtimeConfig = await this.updateAndonRuntimeConfig(serverName, 'stopped');
       if (!runtimeConfig.success) {
         log.error(`${serverName}: Andon runtime config could not be updated after stop: ${runtimeConfig.error || 'unknown error'}`);
@@ -1445,6 +1598,7 @@ class SSHOperations {
     log.info(`Restarting server: ${serverName}`);
     const serverConfig = this.config[serverName];
     if (this.isDockerComposeManaged(serverConfig)) {
+      this.stoppedServers.delete(serverName);
       let launchContext;
       if (typeof options.onBeforeLaunch === 'function') launchContext = await options.onBeforeLaunch();
       const management = serverConfig.tiled_management;
@@ -1469,7 +1623,7 @@ class SSHOperations {
       return { ...result, health };
     }
     const stopResult = await this.stopServer(serverName);
-    if (!stopResult.success && !stopResult.sshDown) {
+    if (!stopResult.success) {
       log.error(`${serverName}: Stop failed during restart`);
       return stopResult;
     }
