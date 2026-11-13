@@ -53,7 +53,12 @@ test('HTTP Tiled launches an AFL proxy on the card host and port using its virtu
   assert.equal(observedUrl, 'http://localhost:8001/api/v1/metadata/');
   const record = Object.values(JSON.parse(await fs.readFile(path.join(directory, 'config.json')))).at(-1);
   assert.equal(record.tiled_server, 'http://tiled.example:8000');
+  operations.localStop = async (spec, python) => {
+    assert.equal(spec.module, 'AFL.automation.shared.TiledProxyDriver');
+    assert.equal(spec.port, 8001);
+    assert.equal(python, '/control/.venv/bin/python');
+    return { success: true, code: 0, output: '{"success":true,"verified":true}' };
+  };
   assert.equal((await operations.stopServer('tiled')).success, true);
-  assert.ok(commands.some(command => command.includes('screen -X -S TiledProxy quit')));
   assert.ok(commands.every(command => !command.includes('docker compose')));
 });

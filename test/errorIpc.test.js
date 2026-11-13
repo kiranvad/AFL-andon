@@ -16,10 +16,11 @@ async function setup(options = {}) {
   const handlers = new Map();
   const events = [];
   const streamCallbacks = new Map();
+  const startupCalls = [];
   let sink;
   let operations;
   const app = Object.assign(new EventEmitter(), {
-    whenReady: () => Promise.resolve(), exit() {}, quit() {}
+    whenReady: () => Promise.resolve(), exit(code) { startupCalls.push(['exit', code]); }, quit() {}
   });
   const runtime = Object.assign(new EventEmitter(), {
     pid: 200, ppid: 100, platform: 'linux', argv: [], env: {}, versions: {},
@@ -28,6 +29,7 @@ async function setup(options = {}) {
   class BrowserWindow extends EventEmitter {
     constructor() {
       super();
+      startupCalls.push(['window']);
       this.webContents = { isDestroyed: () => false, send: (channel, payload) => events.push(payload) };
     }
     async loadFile() {}
@@ -38,6 +40,7 @@ async function setup(options = {}) {
       this.config = options.config || { Sulphur: { host: 'sulphur' }, worker: { host: 'worker' } };
     }
     async initialize() {}
+    async prepareTiledServer() {}
     async getServerLogSize() { return { success: true, size: 0 }; }
     async streamServerLog(name, offset, callbacks) {
       streamCallbacks.set(name, callbacks);
@@ -53,11 +56,15 @@ async function setup(options = {}) {
   ]));
   const mocks = {
     electron: {
-      app, BrowserWindow, dialog: { showOpenDialog: async () => ({ canceled: true }) },
+      app, BrowserWindow, dialog: {
+        showOpenDialog: async () => ({ canceled: true }),
+        showErrorBox: (title, message) => startupCalls.push(['error', title, message])
+      },
       ipcMain: { handle: (channel, callback) => handlers.set(channel, callback), on() {} }
     },
     './logger': { createLogger: () => logger, setLogSink: callback => { sink = callback; } },
     './sshOperations': SSHOperations,
+    './installation': { async installAndon() { if (options.setupError) throw options.setupError; } },
     './combinedLog': { CombinedLogWriter },
     './termination': { signalExitCodes: {}, registerTerminationHandlers() {} }
   };
@@ -69,8 +76,17 @@ async function setup(options = {}) {
   }, { filename: mainPath });
   await new Promise(resolve => setImmediate(resolve));
   const invoke = (channel, ...args) => handlers.get(channel)({ sender: {} }, ...args);
-  return { operations, logger, streamCallbacks, invoke, events, errors: () => events.filter(event => event.type === 'error') };
+  return { operations, logger, streamCallbacks, invoke, events, startupCalls, errors: () => events.filter(event => event.type === 'error') };
 }
+
+test('a first-run setup failure displays the error and exits before creating a window', async () => {
+  const failure = new Error('SSH setup check failed: connection refused');
+  const { operations, startupCalls } = await setup({ setupError: failure });
+  assert.equal(operations, undefined);
+  assert.deepEqual(startupCalls, [
+    ['error', 'AFL Andon setup failed', failure.message], ['exit', 1]
+  ]);
+});
 
 test('failed SSH results preserve exact errors and command output with the affected server', async () => {
   const { operations, invoke, errors } = await setup();

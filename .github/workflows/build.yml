@@ -16,7 +16,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+      - run: npm ci
+        env:
+          AFL_ANDON_BUILD_ONLY: '1'
       - name: Build application
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then

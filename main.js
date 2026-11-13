@@ -8,6 +8,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
 const SSHOperations = require('./sshOperations');
+const { installAndon } = require('./installation');
 const { getSshAuthentication } = require('./sshAuthentication');
 const { isExpectedWebviewNavigationAbort } = require('./electronErrors');
 const { loadTiledProfile } = require('./tiled/profile');
@@ -625,21 +626,36 @@ async function stopManagedServersForShutdown() {
   if (shutdownPromise) return shutdownPromise;
 
   shutdownPromise = (async () => {
-    if (sshOps) {
-      const serverNames = [...andonManagedServers];
-      log.info(`Stopping ${serverNames.length} Andon-managed server(s) before shutdown`);
-      const results = await Promise.allSettled(
-        serverNames.map(serverName => sshOps.stopServer(serverName))
-      );
-      results.forEach((result, index) => {
-        if (result.status === 'rejected') {
-          log.error(`Shutdown: failed to stop ${serverNames[index]}:`, result.reason?.message || result.reason);
-        }
-      });
-      stopAllSessionLogStreams();
-      sshOps.closeTiledTunnels();
+    try {
+      if (sshOps) {
+        const serverNames = [...andonManagedServers];
+        sshOps.beginLocalShutdown?.(serverNames);
+        log.info(`Stopping ${serverNames.length} Andon-managed server(s) before shutdown`);
+        const stopGroup = async names => {
+          const results = await Promise.allSettled(names.map(name => sshOps.stopServer(name)));
+          results.forEach((result, index) => {
+            if (result.status === 'rejected' || !result.value?.success) {
+              log.error(`Shutdown: failed to stop ${names[index]}:`,
+                result.reason?.message || result.value?.error || 'Server shutdown was not verified.');
+            } else {
+              andonManagedServers.delete(names[index]);
+            }
+          });
+        };
+        // Drivers may flush their last data through Tiled while stopping.
+        // Keep the service and its remaining shared tunnels alive until then.
+        const isTiled = name => sshOps.config?.[name]?.server_type === 'tiled';
+        await stopGroup(serverNames.filter(name => !isTiled(name)));
+        await stopGroup(serverNames.filter(isTiled));
+      }
+    } finally {
+      try {
+        stopAllSessionLogStreams();
+      } finally {
+        sshOps?.closeTiledTunnels();
+        await combinedLogWriter.flush();
+      }
     }
-    await combinedLogWriter.flush();
   })().finally(() => {
     shutdownComplete = true;
   });
@@ -666,6 +682,7 @@ app.whenReady().then(async () => {
   }
   
   try {
+    await installAndon({ configPath, sshKeyPath, firstRunOnly: true });
     sshOps = new SSHOperations(configPath, sshKeyPath);
     log.debug('SSHOperations instance created');
     await sshOps.initialize();
@@ -674,6 +691,8 @@ app.whenReady().then(async () => {
   } catch (error) {
     log.error('Failed to initialize application:', error.message);
     log.error('Stack trace:', error.stack);
+    dialog.showErrorBox('AFL Andon setup failed', error.message);
+    app.exit(1);
   }
 });
 
@@ -1117,6 +1136,7 @@ handleIpc('tiled-open-plot', async (event, serverName, entryIds) => {
 handleIpc('add-server', async (event, { serverName, serverConfig }) => {
   log.info(`IPC: add-server ${serverName}`);
   log.debug(`add-server: Config:`, serverConfig);
+  await sshOps.prepareTiledServer(serverConfig);
   sshOps.addServer(serverName, serverConfig);
   await sshOps.saveConfig();
   log.info(`add-server: ${serverName} added successfully`);
@@ -1126,6 +1146,7 @@ handleIpc('add-server', async (event, { serverName, serverConfig }) => {
 handleIpc('update-server', async (event, { serverName, serverConfig }) => {
   log.info(`IPC: update-server ${serverName}`);
   log.debug(`update-server: New config:`, serverConfig);
+  await sshOps.prepareTiledServer(serverConfig);
   sshOps.updateServer(serverName, serverConfig);
   await sshOps.saveConfig();
   log.info(`update-server: ${serverName} updated successfully`);

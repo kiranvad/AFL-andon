@@ -4,6 +4,8 @@
   "description": "AFL server command app / Andon board",
   "main": "main.js",
   "scripts": {
+    "postinstall": "node scripts/install.js",
+    "setup": "node scripts/install.js",
     "start": "electron .",
     "dev": "electron . --debug",
     "build": "electron-builder",

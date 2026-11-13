@@ -14,7 +14,7 @@ const mainSource = fs.readFileSync(mainPath, 'utf8');
 const mainRequire = createRequire(mainPath);
 const nextTurn = () => new Promise(resolve => setImmediate(resolve));
 
-async function setup(t, { env = {} } = {}) {
+async function setup(t, { env = {}, stopFailure = null } = {}) {
   const calls = [];
   const handlers = new Map();
   const runtime = Object.assign(new EventEmitter(), {
@@ -36,12 +36,14 @@ async function setup(t, { env = {} } = {}) {
   let finishStops;
   const stopGate = new Promise(resolve => { finishStops = resolve; });
   class SSHOperations {
+    config = { nas: { server_type: 'tiled' } };
     async initialize() {}
     async startServer(name) { return { success: name !== 'failed' }; }
     async restartServer() { return { success: true }; }
     async stopServer(name) {
       calls.push(['stop', name]);
       await stopGate;
+      if (name === 'failed' && stopFailure) return { success: false, error: stopFailure };
       return name === 'nas' ? { success: true, disconnected: true } : { success: true };
     }
     closeTiledTunnels() { calls.push(['close-tunnels']); }
@@ -49,7 +51,9 @@ async function setup(t, { env = {} } = {}) {
   class CombinedLogWriter {
     async flush() { calls.push(['flush']); }
   }
-  const log = Object.fromEntries(['info', 'debug', 'warn', 'error'].map(level => [level, () => {}]));
+  const errors = [];
+  const log = Object.fromEntries(['info', 'debug', 'warn', 'error'].map(level => [level,
+    (...args) => { if (level === 'error') errors.push(args.join(' ')); }]));
   const mocks = {
     electron: {
       app, BrowserWindow, dialog: {},
@@ -57,6 +61,7 @@ async function setup(t, { env = {} } = {}) {
     },
     './logger': { createLogger: () => log, setLogSink() {} },
     './sshOperations': SSHOperations,
+    './installation': { async installAndon() {} },
     './combinedLog': { CombinedLogWriter },
     './termination': {
       ...mainRequire('./termination'),
@@ -78,7 +83,7 @@ async function setup(t, { env = {} } = {}) {
     await handlers.get('start-server')(event, 'failed');
     await handlers.get('start-server')(event, 'nas');
   };
-  return { calls, app, runtime, finishStops, launch };
+  return { calls, app, runtime, finishStops, launch, errors };
 }
 
 test('terminal hangup waits for the same server cleanup as closing the app', async t => {
@@ -93,7 +98,7 @@ test('terminal hangup waits for the same server cleanup as closing the app', asy
       app.emit('window-all-closed');
     }
     assert.deepEqual(calls, [
-      ['stop', 'started'], ['stop', 'restarted'], ['stop', 'failed'], ['stop', 'nas']
+      ['stop', 'started'], ['stop', 'restarted'], ['stop', 'failed']
     ]);
     finishStops();
     await nextTurn();
@@ -113,9 +118,21 @@ test('loss of the npm launch wrapper runs server cleanup without receiving a sig
   runtime.ppid = 1;
   t.mock.timers.tick(1000);
   assert.deepEqual(calls, [
-    ['stop', 'started'], ['stop', 'restarted'], ['stop', 'failed'], ['stop', 'nas']
+    ['stop', 'started'], ['stop', 'restarted'], ['stop', 'failed']
   ]);
   finishStops();
   await nextTurn();
   assert.deepEqual(calls.at(-1), ['exit', 129]);
+});
+
+test('shutdown reports returned Stop failures and still releases tunnels', async t => {
+  const { app, calls, errors, finishStops, launch } = await setup(t, { stopFailure: 'process remains alive' });
+  await launch();
+  app.emit('window-all-closed');
+  finishStops();
+  await nextTurn();
+  assert.ok(errors.some(error => error.includes('failed') && error.includes('process remains alive')));
+  assert.ok(calls.some(([name]) => name === 'close-tunnels'));
+  assert.ok(calls.findIndex(([name, server]) => name === 'stop' && server === 'nas') >
+    calls.findIndex(([name, server]) => name === 'stop' && server === 'failed'));
 });

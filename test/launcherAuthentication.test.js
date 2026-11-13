@@ -18,7 +18,7 @@ function createRenderer(launchers, invoke = async () => ({ available: false, suc
     focus() {},
     replaceChildren() { this.children = []; },
     appendChild(child) { this.children.push(child); },
-    closest() { return { style: {} }; }
+    group: { style: {} }, closest() { return this.group; }
   }]));
   const form = elements['server-form'];
   form.elements = elements;
@@ -172,6 +172,38 @@ test('selecting a local script saves its file path and clears the previous modul
   assert.equal(saved[0].server.server_script, '');
   assert.equal(saved[0].server.script_file_location, selected);
   assert.equal(saved[0].server.config_file_location, '');
+});
+
+test('Tiled editor hides derived fields, keeps YAML Browse available, and omits stale values', async () => {
+  const selected = '/private configs/tiled.yml';
+  const calls = [];
+  const { context, elements, form, saved } = createRenderer({ tiled: {
+    server_type: 'tiled', host: 'localhost', username: 'user', httpPort: 1234,
+    screen_name: 'tiled', status_url: 'http://stale/healthz', webview_url: 'http://stale/',
+    config_file_location: '/old.yml'
+  } }, async (channel, options) => {
+    calls.push({ channel, options });
+    return { canceled: false, filePaths: [selected] };
+  });
+  context.openServerModal('tiled');
+  for (const id of ['server-http-port', 'server-status-url', 'server-webview-url']) {
+    assert.equal(elements[id].group.style.display, 'none');
+    assert.equal(elements[id].disabled, true);
+  }
+  assert.equal(elements['server-http-port'].required, false);
+  assert.equal(elements['config-file-group'].style.display, 'block');
+  assert.ok(elements['browse-server-config']);
+  await context.browseServerConfig();
+  assert.deepEqual(Array.from(calls[0].options.filters[0].extensions), ['yml', 'yaml']);
+  assert.equal(elements['server-config-file-location'].value, selected);
+  await context.handleServerFormSubmit({ preventDefault() {}, target: form });
+  assert.equal(saved[0].server.config_file_location, selected);
+  for (const key of ['httpPort', 'status_url', 'webview_url']) assert.equal(Object.hasOwn(saved[0].server, key), false);
+  elements['server-type'].value = 'module';
+  context.updateServerTypeFields();
+  assert.equal(elements['server-http-port'].group.style.display, 'block');
+  assert.equal(elements['server-http-port'].required, true);
+  assert.equal(elements['server-http-port'].disabled, false);
 });
 
 test('typing a local script path selects it for copying on start', async t => {

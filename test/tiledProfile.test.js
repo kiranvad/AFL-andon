@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { loadTiledProfile } = require('../tiled/profile');
+const { loadTiledProfile, getTiledConnection } = require('../tiled/profile');
 
 test('loads an external Tiled YAML profile with an inline API key', async () => {
   const readFile = async () =>
@@ -112,4 +112,28 @@ test('a URI client profile launches a local AFL proxy while keeping the upstream
   assert.equal(profile.management.type, 'afl_proxy');
   assert.equal(profile.uri, 'http://tiled.example:8000/');
   assert.equal(profile.apiKey, 'test-key');
+});
+
+test('native Tiled ports and URLs come from YAML instead of stale card fields', async () => {
+  const profile = await loadTiledProfile('/local.yml', { readFile: async () => 'trees: []\nuvicorn:\n  host: 0.0.0.0\n  port: 8111\n' });
+  assert.deepEqual(getTiledConnection({ host: 'localhost', httpPort: 1234 }, profile), {
+    httpPort: 8111, status_url: 'http://localhost:8111/healthz', webview_url: 'http://localhost:8111/'
+  });
+});
+
+test('a proxy YAML can select its local port independently of its NAS URL', async () => {
+  const profile = await loadTiledProfile('/http.yml', { readFile: async () => 'uri: http://nas.example:8000\nuvicorn:\n  port: 8001\n' });
+  assert.equal(profile.uri, 'http://nas.example:8000/');
+  assert.deepEqual(getTiledConnection({ host: 'localhost' }, profile), {
+    httpPort: 8001, status_url: 'http://localhost:8001/healthz', webview_url: 'http://localhost:8001/'
+  });
+});
+
+test('a new proxy card derives its endpoint without separately entering a port', async () => {
+  const profile = await loadTiledProfile('/http.yml', { readFile: async () => 'uri: http://nas.example:8111\n' });
+  assert.equal(getTiledConnection({ host: 'localhost' }, profile).httpPort, 8111);
+});
+
+test('Tiled rejects an invalid YAML port before launch', async () => {
+  await assert.rejects(loadTiledProfile('/bad.yml', { readFile: async () => 'trees: []\nuvicorn:\n  port: 65536\n' }), /uvicorn.port/);
 });

@@ -90,15 +90,25 @@ running when Andon opened are not stopped.
 
 ## Installation
 
-Install dependencies and audit them for security issues:
+Follow [INSTALL.md](INSTALL.md) for the step-by-step fresh-machine guide for
+Linux, macOS, and Windows. Start with **User installation**, including SSH key
+setup for your own account; **Developer and administrator setup** covers
+machine preparation with sudo or administrator access.
+
+After installing the prerequisites and enabling key-based localhost SSH:
 
 ```bash
-npm install
-npm audit fix
+npm ci
+npm start
 ```
 
-If additional issues remain after running `npm audit fix`, review the log and
-update the affected packages.
+Installation verifies SSH login to the current account on `localhost:22` and
+creates `~/.afl/`, its `configs/` and `logs/` directories, and empty
+`~/.afl/launchers.json` and `~/.afl/configs/andon.config.json` files without
+replacing existing settings. SSH setup failures
+produce an error and a nonzero exit status. After fixing SSH, rerun
+`npm run setup`. Desktop builds perform the same setup on their first launch.
+An empty installation opens with no servers and starts no instrument processes.
 
 ## Running
 
@@ -236,23 +246,12 @@ with the launcher's selected authentication method before start, stop,
 restart, and status checks will work. Launchers can use
 password authentication as described above. To use SSH keys instead:
 
-Add one of your local public keys to `~/.ssh/authorized_keys`:
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-grep -qxF "$(cat ~/.ssh/id_ed25519.pub)" ~/.ssh/authorized_keys || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-```
-
-Then verify that localhost SSH works without a password:
-
-```bash
-ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no localhost true
-```
-
-If you prefer a different key, either update the command above or point the
-application at that key with `SERVER_CONTROL_SSH_KEY_PATH` or the Settings UI.
+Use [Set up SSH keys for your account in INSTALL.md](INSTALL.md#ssh-key-setup)
+to create and authorize a key and verify login. If the SSH service is unavailable,
+an administrator can follow [Enable the SSH server](INSTALL.md#enable-ssh-server).
+The installation check requires key-based localhost access; individual launchers can still use
+password authentication. For a different key, set
+`SERVER_CONTROL_SSH_KEY_PATH` or select it in the Settings UI after setup.
 
 ## Tiled Server
 
