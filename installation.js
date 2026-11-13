@@ -10,18 +10,25 @@ async function checkLocalSsh(sshKeyPath, { clientFactory } = {}) {
   // Use Andon's own authentication path: success in an external SSH agent alone
   // does not establish that the application can use the installed key.
   const operations = new SSHOperations(undefined, sshKeyPath, { clientFactory });
-  await operations.loadSSHKey();
   const username = os.userInfo().username;
   operations.config = { installation: { host: 'localhost', username, sshPort: 22 } };
   try {
+    await operations.loadSSHKey({ quiet: true });
+    if (operations.getAvailableSSHKeys().length === 0) {
+      throw new Error('No readable SSH private key was found for this user account.');
+    }
     const { conn } = await operations.connectWithAvailableKeys('installation', 5000);
     conn.end();
   } catch (error) {
+    const serviceUnavailable = ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN'].includes(error.code);
+    const section = serviceUnavailable
+      ? 'Developer and administrator setup > 2. Enable the SSH server (INSTALL.md#enable-ssh-server)'
+      : 'User installation > 2. Set up SSH keys for your account (INSTALL.md#ssh-key-setup)';
     throw new Error(
       `SSH setup check failed for ${username}@localhost:22: ${error.message}\n` +
-      'Enable the local SSH server and authorize a readable, unencrypted private key for this account. ' +
-      'Set SERVER_CONTROL_SSH_KEY_PATH if the key is outside the standard ~/.ssh locations. ' +
-      'See INSTALL.md, then rerun npm run setup.',
+      `Read: ${section}\n` +
+      `Guide: ${path.join(__dirname, 'INSTALL.md')}\n` +
+      'After completing those steps, rerun npm run setup from the checkout as the same user.',
       { cause: error }
     );
   }

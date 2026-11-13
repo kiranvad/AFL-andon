@@ -91,7 +91,10 @@ running when Andon opened are not stopped.
 ## Installation
 
 Follow [INSTALL.md](INSTALL.md) for the step-by-step fresh-machine guide for
-Linux, macOS, and Windows, including SSH setup and installation checks.
+Linux, macOS, and Windows. Start with **User installation**, including SSH key
+setup for your own account; **Developer and administrator setup** covers
+machine preparation with sudo or administrator access.
+
 After installing the prerequisites and enabling key-based localhost SSH:
 
 ```bash
@@ -242,9 +245,10 @@ with the launcher's selected authentication method before start, stop,
 restart, and status checks will work. Launchers can use
 password authentication as described above. To use SSH keys instead:
 
-Use the [SSH setup steps in INSTALL.md](INSTALL.md#3-enable-and-test-localhost-ssh)
-to enable the SSH server, authorize a key, and verify login. The installation
-check requires key-based localhost access; individual launchers can still use
+Use [Set up SSH keys for your account in INSTALL.md](INSTALL.md#ssh-key-setup)
+to create and authorize a key and verify login. If the SSH service is unavailable,
+an administrator can follow [Enable the SSH server](INSTALL.md#enable-ssh-server).
+The installation check requires key-based localhost access; individual launchers can still use
 password authentication. For a different key, set
 `SERVER_CONTROL_SSH_KEY_PATH` or select it in the Settings UI after setup.
 

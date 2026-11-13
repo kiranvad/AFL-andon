@@ -105,7 +105,11 @@ test('a disabled SSH server fails first-run setup and can be retried safely', as
   const { configPath } = await temporaryHome(t);
   const ssh = sshFixture('error', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }));
   await assert.rejects(installAndon({ configPath, firstRunOnly: true, clientFactory: ssh.clientFactory }),
-    /SSH setup check failed for install-user@localhost:22: connect ECONNREFUSED/);
+    error => {
+      assert.match(error.message, /SSH setup check failed for install-user@localhost:22: connect ECONNREFUSED/);
+      assert.match(error.message, /Developer and administrator setup > 2\. Enable the SSH server \(INSTALL\.md#enable-ssh-server\)/);
+      return true;
+    });
   await assert.rejects(fs.access(configPath), { code: 'ENOENT' });
   assert.equal(ssh.connections[0].ended, true);
   const working = sshFixture();
@@ -114,14 +118,24 @@ test('a disabled SSH server fails first-run setup and can be retried safely', as
   await installAndon({ configPath, firstRunOnly: true, clientFactory() { throw new Error('Should not recheck an installed account'); } });
 });
 
-test('missing keys and rejected authentication do not count as enabled SSH access', async t => {
+test('missing keys and rejected authentication point to the user SSH key instructions', async t => {
   const { keyPath, configPath } = await temporaryHome(t, { key: false });
-  await assert.rejects(checkLocalSsh(), /SSH setup check failed.*No SSH key or session password is available/);
+  await assert.rejects(checkLocalSsh(), error => {
+    assert.match(error.message, /No readable SSH private key was found for this user account/);
+    assert.match(error.message, /User installation > 2\. Set up SSH keys for your account \(INSTALL\.md#ssh-key-setup\)/);
+    assert.ok(error.message.includes(`Guide: ${path.resolve(__dirname, '../INSTALL.md')}`));
+    assert.match(error.message, /rerun npm run setup.*same user/);
+    return true;
+  });
   await fs.mkdir(path.dirname(keyPath));
   await fs.writeFile(keyPath, 'private-key-fixture');
   const failure = Object.assign(new Error('All configured authentication methods failed'), { level: 'client-authentication' });
   const ssh = sshFixture('error', failure);
-  await assert.rejects(installAndon({ configPath, clientFactory: ssh.clientFactory }), /authentication methods failed/);
+  await assert.rejects(installAndon({ configPath, clientFactory: ssh.clientFactory }), error => {
+    assert.match(error.message, /authentication methods failed/);
+    assert.match(error.message, /INSTALL\.md#ssh-key-setup/);
+    return true;
+  });
   await assert.rejects(fs.access(configPath), { code: 'ENOENT' });
 });
 
@@ -134,11 +148,25 @@ test('SSH setup times out and closes a connection that never authenticates', asy
     connect() { connected(); }, end() {}, destroy() { this.destroyed = true; }
   });
   const check = checkLocalSsh(undefined, { clientFactory: () => client });
-  const rejection = assert.rejects(check, /SSH connection timed out after 5000ms/);
+  const rejection = assert.rejects(check, error => {
+    assert.match(error.message, /SSH connection timed out after 5000ms/);
+    assert.match(error.message, /INSTALL\.md#enable-ssh-server/);
+    return true;
+  });
   await gate;
   t.mock.timers.tick(5000);
   await rejection;
   assert.equal(client.destroyed, true);
+});
+
+test('SSH error references resolve to named installation guide sections', async () => {
+  const guide = await fs.readFile(path.resolve(__dirname, '../INSTALL.md'), 'utf8');
+  for (const [anchor, heading] of [
+    ['ssh-key-setup', '### 2. Set up SSH keys for your account'],
+    ['enable-ssh-server', '### 2. Enable the SSH server']
+  ]) {
+    assert.ok(guide.includes(`<a id="${anchor}"></a>\n\n${heading}`));
+  }
 });
 
 test('CLI fails with status 1; only postinstall has a build-only exception', async () => {

@@ -173,7 +173,7 @@ class SSHOperations {
     }
   }
 
-  async loadSSHKey() {
+  async loadSSHKey({ quiet = false } = {}) {
     log.debug('Loading SSH key');
     const sshDir = path.join(os.homedir(), '.ssh');
     const candidatePaths = [];
@@ -199,7 +199,7 @@ class SSHOperations {
       try {
         const key = await fs.readFile(keyPath);
         this.sshKeys.push({ path: keyPath, key });
-        log.info(`Loaded SSH key from: ${keyPath}`);
+        if (!quiet) log.info(`Loaded SSH key from: ${keyPath}`);
       } catch (error) {
         log.debug(`Could not load SSH key from ${keyPath}: ${error.message}`);
       }
@@ -208,13 +208,13 @@ class SSHOperations {
     if (this.sshKeys.length > 0) {
       this.sshKey = this.sshKeys[0].key;
       this.sshKeyPath = this.sshKeys[0].path;
-      log.info(`Loaded ${this.sshKeys.length} SSH key(s); defaulting to ${this.sshKeyPath}`);
+      if (!quiet) log.info(`Loaded ${this.sshKeys.length} SSH key(s); defaulting to ${this.sshKeyPath}`);
       return;
     }
 
     this.sshKey = null;
     const triedPaths = candidatePaths.filter(Boolean);
-    log.info('No SSH key found; password launchers can authenticate with a session password.');
+    if (!quiet) log.info('No SSH key found; password launchers can authenticate with a session password.');
     log.debug(`SSH key paths tried: ${triedPaths.join(', ')}`);
   }
 
