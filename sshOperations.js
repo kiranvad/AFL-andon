@@ -8,6 +8,7 @@ const { loadTiledProfile, isTiledProxy } = require('./tiled/profile');
 const { appendAflTiledConfig, updateAflTiledConfig } = require('./aflGlobalConfig');
 const { getSshAuthentication, getSshCredentialId } = require('./sshAuthentication');
 const TiledTunnel = require('./tiledTunnel');
+const { ensureLauncherConfig } = require('./configBootstrap');
 
 const log = createLogger('ssh');
 const ANDON_CONFIG_FILENAME = 'andon.config.json';
@@ -96,8 +97,7 @@ class SSHOperations {
   async loadConfig() {
     log.debug(`Loading config from ${this.configPath}`);
     try {
-      const configData = await fs.readFile(this.configPath, 'utf8');
-      this.config = JSON.parse(configData);
+      this.config = await ensureLauncherConfig(this.configPath);
       const serverCount = this.getServerEntries().length;
       log.info(`Loaded config with ${serverCount} servers from ${this.configPath}`);
       
@@ -152,10 +152,7 @@ class SSHOperations {
       }
     } catch (error) {
       log.error(`Failed to load config from ${this.configPath}:`, error.message);
-      if (error.code === 'ENOENT') {
-        log.warn('Config file does not exist - starting with empty config');
-        this.config = {};
-      }
+      throw error;
     }
   }
 

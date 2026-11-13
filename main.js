@@ -8,6 +8,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const os = require('os');
 const SSHOperations = require('./sshOperations');
+const { installAndon } = require('./installation');
 const { getSshAuthentication } = require('./sshAuthentication');
 const { isExpectedWebviewNavigationAbort } = require('./electronErrors');
 const { loadTiledProfile } = require('./tiled/profile');
@@ -666,6 +667,7 @@ app.whenReady().then(async () => {
   }
   
   try {
+    await installAndon({ configPath, sshKeyPath, firstRunOnly: true });
     sshOps = new SSHOperations(configPath, sshKeyPath);
     log.debug('SSHOperations instance created');
     await sshOps.initialize();
@@ -674,6 +676,8 @@ app.whenReady().then(async () => {
   } catch (error) {
     log.error('Failed to initialize application:', error.message);
     log.error('Stack trace:', error.stack);
+    dialog.showErrorBox('AFL Andon setup failed', error.message);
+    app.exit(1);
   }
 });
 

@@ -57,6 +57,7 @@ async function setup(t, { env = {} } = {}) {
     },
     './logger': { createLogger: () => log, setLogSink() {} },
     './sshOperations': SSHOperations,
+    './installation': { async installAndon() {} },
     './combinedLog': { CombinedLogWriter },
     './termination': {
       ...mainRequire('./termination'),
