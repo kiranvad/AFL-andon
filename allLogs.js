@@ -30,13 +30,59 @@ function capEntries(entries, limit = MAX_MERGED_LINES) {
   return entries.length > safeLimit ? entries.slice(entries.length - safeLimit) : entries;
 }
 
-function filterEntries(entries, enabledServers, search = '') {
+function filterEntries(entries, enabledServers, search = '', hiddenSources = new Set()) {
   const query = String(search).trim().toLocaleLowerCase();
   return entries.filter(entry => {
     if (enabledServers && !enabledServers.has(entry.server)) return false;
+    if (hiddenSources.has(entry.source)) return false;
     return !query || String(entry.text).toLocaleLowerCase().includes(query) ||
       String(entry.server).toLocaleLowerCase().includes(query);
   });
+}
+
+// Flask and AFL's file handler identify the calling Python module, even when
+// APIServer, QueueDaemon and a driver share the same logger.
+class LogSourceTracker {
+  constructor() {
+    this.states = new Map();
+  }
+
+  classify(serverName, line) {
+    const text = String(line);
+    const header = text.match(/^(?:\[[^\]\r\n]+\]\s*)?(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s+in\s+([\w.]+):\s*/i);
+    if (header) {
+      const moduleName = header[1].replace(/\.py$/i, '').split('.').pop().toLowerCase();
+      const source = moduleName === 'apiserver' ? 'APIServer' : moduleName === 'queuedaemon' ? 'QueueDaemon' : null;
+      if (source) {
+        this.states.set(serverName, {
+          source,
+          traceback: text.slice(header[0].length).startsWith('Traceback (most recent call last):')
+        });
+      } else {
+        this.reset(serverName);
+      }
+      return source;
+    }
+
+    const state = this.states.get(serverName);
+    if (!state) return null;
+    if (/^(?:Traceback \(most recent call last\):|During handling of the above exception|The above exception was the direct cause)/.test(text)) {
+      state.traceback = true;
+      return state.source;
+    }
+    if (!text || /^\s/.test(text)) return state.source;
+    if (state.traceback && /^[\w.]+(?::|$)/.test(text)) {
+      state.traceback = false;
+      return state.source;
+    }
+    // An unprefixed print from a driver has no module attribution.
+    this.reset(serverName);
+    return null;
+  }
+
+  reset(serverName) {
+    this.states.delete(serverName);
+  }
 }
 
 function stableServerColor(serverName) {
@@ -76,6 +122,7 @@ module.exports = {
   stripTerminalControl,
   capEntries,
   filterEntries,
+  LogSourceTracker,
   stableServerColor,
   isRoutineHealthLog
 };

@@ -665,6 +665,11 @@
                     <label><input id="all-logs-autoscroll" type="checkbox" checked> Auto-scroll</label>
                     <span id="all-logs-status">No started servers</span>
                 </div>
+                <div class="all-logs-toolbar" role="group" aria-label="Log source filters">
+                    <span>Show across all servers:</span>
+                    <label class="all-logs-filter"><input id="all-logs-apiserver" type="checkbox" checked> APIServer</label>
+                    <label class="all-logs-filter"><input id="all-logs-queuedaemon" type="checkbox" checked> QueueDaemon</label>
+                </div>
                 <div id="all-logs-filters" aria-label="Server filters"></div>
                 <div id="all-logs-output" role="log" aria-live="off">
                     <div id="all-logs-empty">Start or restart a server to begin collecting logs.</div>

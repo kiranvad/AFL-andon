@@ -59,6 +59,12 @@ the Screen session exists. It captures startup and later output without polling
 a fixed-size tail or loading older history. Streams continue while the view is
 hidden and close after a successful Stop.
 
+Use the **APIServer** and **QueueDaemon** checkboxes in **All Logs** to show or
+hide each module's messages across every server. Both are shown by default.
+These controls work together with the server checkboxes and search, and apply
+to collected history and incoming output. Re-enabling a module restores its
+retained messages; hiding it does not interrupt streaming or saving logs.
+
 The combined view includes both server output and Andon's own application log
 messages. These entries are also saved for the full Andon session in
 `~/.afl/logs/combined/`. Each launch creates a separate file whose name

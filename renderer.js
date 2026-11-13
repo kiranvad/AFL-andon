@@ -16,6 +16,7 @@ const {
   stripTerminalControl,
   capEntries,
   filterEntries,
+  LogSourceTracker,
   stableServerColor,
   isRoutineHealthLog
 } = require('./allLogs');
@@ -51,6 +52,8 @@ const startedServers = new Set();
 const displayedServerStatuses = new Map();
 const queueHealthWarnings = new Map();
 const allLogServers = new Map();
+const hiddenLogSources = new Set();
+const logSourceTracker = new LogSourceTracker();
 let mergedLogEntries = [];
 let allLogsPaused = false;
 const logChunkRemainders = new Map();
@@ -188,7 +191,7 @@ function renderAllLogs() {
   const keepAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 24;
   const enabled = new Set([...allLogServers].filter(([, state]) => state.enabled).map(([name]) => name));
   const search = document.getElementById('all-logs-search')?.value || '';
-  const entries = filterEntries(mergedLogEntries, enabled, search);
+  const entries = filterEntries(mergedLogEntries, enabled, search, hiddenLogSources);
   const fragment = document.createDocumentFragment();
   if (!entries.length) {
     const empty = document.createElement('div');
@@ -258,21 +261,23 @@ function handleServerLogStream({ serverName, type, data = '', status, error = ''
   const state = ensureAllLogServer(serverName);
   if (reset) {
     logChunkRemainders.delete(serverName);
+    logSourceTracker.reset(serverName);
   }
   if (type === 'data') {
     const decoded = decodeLogChunk(logChunkRemainders.get(serverName) || '', stripTerminalControl(data));
     logChunkRemainders.set(serverName, decoded.remainder);
     const entries = decoded.lines
-      .filter(text => !isRoutineHealthLog(serverName, config?.[serverName], text))
-      .map(text => ({ server: serverName, text, observedAt, type: 'log' }));
+      .map(text => ({ server: serverName, text, observedAt, type: 'log', source: logSourceTracker.classify(serverName, text) }))
+      .filter(entry => !isRoutineHealthLog(serverName, config?.[serverName], entry.text));
     addMergedLogEntries(entries, { persist: !persisted });
   } else if (type === 'status') {
     if (status === 'stopped') {
       const remainder = logChunkRemainders.get(serverName) || '';
       if (remainder && !isRoutineHealthLog(serverName, config?.[serverName], remainder)) {
-        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log' }]);
+        addMergedLogEntries([{ server: serverName, text: remainder, observedAt, type: 'log', source: logSourceTracker.classify(serverName, remainder) }]);
       }
       logChunkRemainders.delete(serverName);
+      logSourceTracker.reset(serverName);
       state.lifecycle = 'stopped';
       state.connection = 'stopped';
     } else if (status === 'connected') {
@@ -1580,6 +1585,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('ssh-password-cancel').addEventListener('click', () => finishSshPasswordPrompt());
 
   document.getElementById('all-logs-search').addEventListener('input', renderAllLogs);
+  for (const source of ['APIServer', 'QueueDaemon']) {
+    const checkbox = document.getElementById(`all-logs-${source.toLowerCase()}`);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) hiddenLogSources.delete(source);
+      else hiddenLogSources.add(source);
+      renderAllLogs();
+    });
+  }
   document.getElementById('all-logs-pause').addEventListener('click', () => {
     allLogsPaused = !allLogsPaused;
     document.getElementById('all-logs-pause').textContent = allLogsPaused ? 'Resume' : 'Pause';
