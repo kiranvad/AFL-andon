@@ -45,6 +45,8 @@ test('installation authenticates with Andon and creates private, empty configura
   const result = await installAndon({ configPath, clientFactory: ssh.clientFactory });
   assert.equal(result.configPath, configPath);
   assert.deepEqual(JSON.parse(await fs.readFile(configPath, 'utf8')), {});
+  const runtimePath = path.join(directory, '.afl', 'configs', 'andon.config.json');
+  assert.deepEqual(JSON.parse(await fs.readFile(runtimePath, 'utf8')), {});
   for (const name of ['configs', 'logs']) {
     assert.ok((await fs.stat(path.join(directory, '.afl', name))).isDirectory());
   }
@@ -59,6 +61,7 @@ test('installation authenticates with Andon and creates private, empty configura
   assert.deepEqual(operations.getServerEntries(), []);
   if (process.platform !== 'win32') {
     assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(runtimePath)).mode & 0o777, 0o600);
     assert.equal((await fs.stat(path.dirname(configPath))).mode & 0o777, 0o700);
   }
 });
@@ -67,17 +70,44 @@ test('setup preserves existing launchers and respects a custom config and SSH ke
   const { directory } = await temporaryHome(t, { key: false });
   const configPath = path.join(directory, 'private', 'launchers.json');
   const sshKeyPath = path.join(directory, 'custom-key');
+  const runtimePath = path.join(directory, '.afl', 'configs', 'andon.config.json');
   const original = '{"worker":{"host":"worker.example","username":"worker-user"}}\n';
+  const originalRuntime = '{"launchers":{"worker":{"runtime_state":"stopped"}},"notes":"existing settings"}\n';
   await fs.mkdir(path.dirname(configPath));
+  await fs.mkdir(path.dirname(runtimePath), { recursive: true });
   await fs.writeFile(configPath, original);
+  await fs.writeFile(runtimePath, originalRuntime);
   await fs.writeFile(sshKeyPath, 'custom-key-fixture');
   const ssh = sshFixture();
   await installAndon({ configPath, sshKeyPath, clientFactory: ssh.clientFactory });
   await installAndon({ configPath, sshKeyPath, clientFactory: ssh.clientFactory });
   assert.equal(await fs.readFile(configPath, 'utf8'), original);
+  assert.equal(await fs.readFile(runtimePath, 'utf8'), originalRuntime);
   assert.equal(ssh.calls.length, 2);
   assert.equal(ssh.calls[0].privateKey.toString(), 'custom-key-fixture');
   assert.ok((await fs.stat(path.join(directory, '.afl', 'configs'))).isDirectory());
+});
+
+test('startup repairs an older installation missing the runtime config without rechecking SSH', async t => {
+  const { directory, configPath } = await temporaryHome(t, { key: false });
+  await fs.mkdir(path.dirname(configPath));
+  const original = '{"agent":{"host":"localhost","username":"install-user"}}\n';
+  await fs.writeFile(configPath, original);
+  await installAndon({ configPath, firstRunOnly: true, clientFactory() { assert.fail('An existing installation should not recheck SSH'); } });
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(directory, '.afl', 'configs', 'andon.config.json'), 'utf8')), {});
+  assert.equal(await fs.readFile(configPath, 'utf8'), original);
+});
+
+test('startup rejects an invalid existing runtime config without replacing it', async t => {
+  const { directory, configPath } = await temporaryHome(t, { key: false });
+  const runtimePath = path.join(directory, '.afl', 'configs', 'andon.config.json');
+  await fs.mkdir(path.dirname(runtimePath), { recursive: true });
+  await fs.writeFile(configPath, '{}\n');
+  for (const contents of ['{broken', '[]', 'null']) {
+    await fs.writeFile(runtimePath, contents);
+    await assert.rejects(installAndon({ configPath, firstRunOnly: true }), /[Aa]ndon configuration/);
+    assert.equal(await fs.readFile(runtimePath, 'utf8'), contents);
+  }
 });
 
 test('missing nested launcher paths are initialized without a load error', async t => {

@@ -1818,7 +1818,7 @@ class SSHOperations {
     return entry ? entry[0] : null;
   }
 
-  async readRemoteFile(host, remotePath, serverName = this.getServerNameForHost(host)) {
+  async readRemoteFile(host, remotePath, serverName = this.getServerNameForHost(host), options = {}) {
     const server = this.config[serverName];
     if (!server || server.host !== host) {
       log.error(`Cannot read remote file: no server for host ${host}`);
@@ -1847,6 +1847,11 @@ class SSHOperations {
         sftp.readFile(remotePath, 'utf8', (err, data) => {
           conn.end();
           if (err) {
+            if (options.allowMissing && (err.code === 2 || err.code === 'ENOENT')) {
+              log.debug(`Optional file ${remotePath} does not exist yet on ${host}`);
+              resolve({ success: false, missing: true, error: err.message });
+              return;
+            }
             log.error(`Failed to read ${remotePath} on ${host}:`, err.message);
             resolve({ success: false, error: err.message });
           } else {
@@ -1945,9 +1950,9 @@ class SSHOperations {
     const remotePath = `${homePath}/.afl/configs/${ANDON_CONFIG_FILENAME}`;
     log.info(`Getting Andon config from ${host}: ${remotePath}`);
     
-    const res = await this.readRemoteFile(host, remotePath, serverName);
+    const res = await this.readRemoteFile(host, remotePath, serverName, { allowMissing: true });
     if (!res.success) {
-      if (/no such file|enoent/i.test(res.error || '')) {
+      if (res.missing) {
         log.info(`No Andon config exists yet on ${host}`);
         return { success: true, data: {} };
       }
@@ -1956,12 +1961,16 @@ class SSHOperations {
     
     try {
       const parsed = JSON.parse(res.data);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Expected a JSON object (use {} for an empty configuration).');
+      }
       const keyCount = Object.keys(parsed).length;
       log.info(`Parsed Andon config from ${host}: ${keyCount} entries`);
       return { success: true, data: parsed };
     } catch (parseError) {
-      log.warn(`Remote Andon config on ${host} is empty or invalid JSON: ${parseError.message}`);
-      return { success: true, data: {} };
+      const error = `Invalid Andon configuration ${remotePath} on ${host}: ${parseError.message}`;
+      log.error(error);
+      return { success: false, error };
     }
   }
 

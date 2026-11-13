@@ -103,8 +103,9 @@ npm start
 ```
 
 Installation verifies SSH login to the current account on `localhost:22` and
-creates `~/.afl/`, its `configs/` and `logs/` directories, and an empty
-`~/.afl/launchers.json` without replacing existing settings. SSH setup failures
+creates `~/.afl/`, its `configs/` and `logs/` directories, and empty
+`~/.afl/launchers.json` and `~/.afl/configs/andon.config.json` files without
+replacing existing settings. SSH setup failures
 produce an error and a nonzero exit status. After fixing SSH, rerun
 `npm run setup`. Desktop builds perform the same setup on their first launch.
 An empty installation opens with no servers and starts no instrument processes.

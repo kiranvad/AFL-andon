@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const SSHOperations = require('./sshOperations');
-const { ensureLauncherConfig } = require('./configBootstrap');
+const { ensureLauncherConfig, ensureAndonConfig } = require('./configBootstrap');
 
 async function checkLocalSsh(sshKeyPath, { clientFactory } = {}) {
   // Use Andon's own authentication path: success in an external SSH agent alone
@@ -56,6 +56,7 @@ async function installAndon({
   const aflDirectory = path.join(os.homedir(), '.afl');
   await fs.mkdir(path.join(aflDirectory, 'configs'), { recursive: true, mode: 0o700 });
   await fs.mkdir(path.join(aflDirectory, 'logs'), { recursive: true, mode: 0o700 });
+  await ensureAndonConfig(path.join(aflDirectory, 'configs', 'andon.config.json'));
   await ensureLauncherConfig(configPath);
   return { configPath, aflDirectory };
 }

@@ -186,12 +186,13 @@ without executing a command or starting a server. Successful setup creates:
 ~/.afl/
   launchers.json     # {} for a new installation
   configs/
+    andon.config.json  # {} initially; server runtime records are saved here
   logs/
 ```
 
 On Windows, `~` is the current user's home directory, usually
 `C:\Users\<username>`. Setup-created directories use mode `0700` and the
-launcher file uses `0600` on Unix; existing files and permissions are preserved.
+configuration files use `0600` on Unix; existing files and permissions are preserved.
 Repeating setup does not replace launcher definitions. If
 `SERVER_CONTROL_CONFIG_PATH` is set, setup creates or validates that launcher
 file and its parent directories instead; the `.afl` config/log directories are
