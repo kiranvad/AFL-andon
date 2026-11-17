@@ -1,6 +1,6 @@
 # AFL Andon
 
-This Electron application provides a cross‑platform control panel for managing
+This Electron application provides a control panel for managing
 remote servers.  Each server is defined in a JSON configuration file.  The app
 can start, stop and restart screen sessions over SSH, display their current
 status and open their web interfaces.  A built‑in terminal allows joining a
@@ -85,15 +85,18 @@ running when Andon opened are not stopped.
 
 ## Prerequisites
 
-- **Node.js 20** or newer is required. Install via [nvm](https://github.com/nvm-sh/nvm) or your
-  preferred method.
+- Use **Node.js 26.13.1**, the version tested with this checkout. Install via
+  [nvm](https://github.com/nvm-sh/nvm) with `nvm install 26.13.1` and
+  `nvm use 26.13.1`, or use the
+  [official release](https://nodejs.org/dist/v26.13.1/). The repository's
+  `.nvmrc`, package requirements, and release builds select this version.
 
 ## Installation
 
 Follow [INSTALL.md](INSTALL.md) for the step-by-step fresh-machine guide for
-Linux, macOS, and Windows. Start with **User installation**, including SSH key
-setup for your own account; **Developer and administrator setup** covers
-machine preparation with sudo or administrator access.
+Linux, the platform tested with this checkout. Start with **User installation**,
+including SSH key setup for your own account; **Developer and administrator
+setup** covers machine preparation with sudo or administrator access.
 
 After installing the prerequisites and enabling key-based localhost SSH:
 
@@ -416,14 +419,32 @@ second server type or launcher is needed.
 
 ## Building
 
-Builds for your current platform can be created with:
+Build a Linux AppImage with:
 
 ```bash
-npm run build
+npm run build:linux
 ```
 
-See `package.json` for platform-specific build scripts.
-The CI workflow produces installers for each OS:
-* macOS: DMG
-* Linux: AppImage
-* Windows: NSIS exe
+Pull requests and pushes to `main` build Linux AppImages and make them available
+as GitHub Actions artifacts. Pushing a version tag such as `v1.0.1` runs the same build
+and publishes the AppImages and `SHA256SUMS.txt` to a GitHub Release in the
+repository receiving the tag after the Linux build succeeds.
+Tags containing a hyphen, such as `v1.0.1-beta.1`, create prereleases.
+
+The tag must equal `v` followed by the version in `package.json`. To publish
+a new version, update and commit the version files first, then push the tag:
+
+```bash
+npm version 1.0.1 --no-git-tag-version
+npm run check-package
+git add package.json package-lock.json
+git commit -m "Release 1.0.1"
+git push origin HEAD
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+Choose the next version for your release. The tagged commit must include
+`.github/workflows/release.yml`. These builds use Node.js 26.13.1 from `.nvmrc`
+and require no separate publishing token; the workflow uses `GITHUB_TOKEN`.
+The AppImages are unsigned.
