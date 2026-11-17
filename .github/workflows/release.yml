@@ -1,0 +1,66 @@
+name: Publish Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Validate release tag
+        run: node scripts/validate-release-tag.js
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+
+  build:
+    needs: validate
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-artifacts'
+          merge-multiple: true
+          path: installers
+      - name: Publish installers and checksums
+        working-directory: installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          appimages=(*.AppImage)
+          dmgs=(*.dmg)
+          exes=(*.exe)
+          if (( ${#appimages[@]} == 0 || ${#dmgs[@]} == 0 || ${#exes[@]} == 0 )); then
+            echo 'Expected AppImage, DMG, and Windows NSIS installers.' >&2
+            exit 1
+          fi
+          installers=("${appimages[@]}" "${dmgs[@]}" "${exes[@]}")
+          sha256sum "${installers[@]}" > SHA256SUMS.txt
+
+          options=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${installers[@]}" SHA256SUMS.txt "${options[@]}"

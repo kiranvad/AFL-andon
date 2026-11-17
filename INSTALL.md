@@ -32,15 +32,18 @@ git --version
 ssh -V
 ```
 
-All commands must succeed. Node.js must be version 20 or newer; use a maintained
-LTS release such as 24 on a fresh machine. If you already use nvm, select Node
-with `nvm install 24` and `nvm use 24`. To install Node in your own account,
+All commands must succeed. Use **Node.js 26.13.1**, the version tested with
+this checkout; `node --version` must print `v26.13.1`. If you already use nvm,
+select it with `nvm install 26.13.1` and `nvm use 26.13.1`. Inside the checkout,
+`nvm install` and `nvm use` select the same version from `.nvmrc`.
+To install Node in your own account,
 follow [nvm's installation instructions](https://github.com/nvm-sh/nvm#installing-and-updating).
 Git, the SSH client/server, and desktop libraries can be installed by an
 administrator using the instructions below.
 
 For a trusted desktop build (Linux AppImage, macOS DMG, or Windows NSIS
-installer), local Node.js and Git are unnecessary. Complete the SSH key setup
+installer) from your repository's GitHub **Releases** page, local Node.js and
+Git are unnecessary. Complete the SSH key setup
 below, install/open that build, and continue with step 4. The built application
 performs configuration setup on first launch.
 
@@ -179,6 +182,12 @@ branch or release, select it before `npm ci`. Do not use `sudo npm ci`,
 `--ignore-scripts`, or `--omit=dev` for a user installation; Electron is an npm
 development dependency, and the postinstall hook performs user setup.
 
+Installation applies the checked-in SSH compatibility patch, rebuilds its
+optional native crypto binding, and downloads Electron before user setup.
+The patch replaces a V8 API removed in Node 26. It is reapplied on every
+fresh `npm ci`; no manual changes to `node_modules` are needed. If native
+build tools are unavailable, SSH retains its JavaScript fallback.
+
 The installer authenticates to your account on `localhost:22`, then disconnects
 without executing a command or starting a server. Successful setup creates:
 
@@ -252,10 +261,10 @@ creation, npm installation, development, and builds run as a regular user.
 
 ### 1. Install machine prerequisites
 
-For source installations, provide Git, a supported Node.js LTS release with
-npm (minimum Node 20), OpenSSH client/server, and Electron desktop libraries.
-Node LTS can be installed from [nodejs.org](https://nodejs.org/en/download) or
-with nvm under the application user's account.
+For source installations, provide Git, **Node.js 26.13.1** with its bundled
+npm, OpenSSH client/server, and Electron desktop libraries. Install this exact
+Node version from the [official release](https://nodejs.org/dist/v26.13.1/)
+or with `nvm install 26.13.1` under the application user's account.
 
 #### Ubuntu and Debian
 
@@ -266,30 +275,32 @@ sudo apt-get update
 sudo apt-get install -y git openssh-client openssh-server libgtk-3-0 libnss3 libgbm1 libasound2t64 libxss1
 ```
 
-On older releases, substitute `libasound2` for `libasound2t64`. Install Node
-LTS separately if the distribution's Node package is older than 20. Install
+On older releases, substitute `libasound2` for `libasound2t64`. Install Node.js
+26.13.1 separately as described above. Install
 `screen` on this machine if it will host local Screen-based launchers.
 
 #### Fedora and other Linux distributions
 
 ```bash
-sudo dnf install -y git openssh-clients openssh-server nodejs npm gtk3 nss mesa-libgbm alsa-lib libXScrnSaver
+sudo dnf install -y git openssh-clients openssh-server gtk3 nss mesa-libgbm alsa-lib libXScrnSaver
 ```
 
-Verify the Node version and install a maintained LTS if needed. On other
+Install Node.js 26.13.1 separately as described above. On other
 distributions, install equivalent packages through their package manager.
 
 #### macOS
 
-Install Node LTS and Git, for example using `xcode-select --install` for Apple's
-command-line tools. OpenSSH is included with macOS. Enable Remote Login below.
+Install Node.js 26.13.1 as described above and Git, for example using
+`xcode-select --install` for Apple's command-line tools. OpenSSH is included
+with macOS. Enable Remote Login below.
 
 #### Windows 10 and 11
 
-Install Node.js LTS and Git for Windows, using the installers or winget:
+Install **Node.js 26.13.1** using the Windows installer for your architecture
+from the [official release](https://nodejs.org/dist/v26.13.1/).
+Install Git for Windows using its installer or winget:
 
 ```powershell
-winget install --id OpenJS.NodeJS.LTS --exact
 winget install --id Git.Git --exact
 ```
 
@@ -394,6 +405,9 @@ After a normal user installation, build your current platform with
 `npm run build`; artifacts are written to `dist/`. Platform scripts are
 `npm run build:linux`, `npm run build:mac`, and `npm run build:win`.
 
+Desktop releases use SSH's JavaScript fallback and exclude the optional native
+SSH modules compiled for the source installation's Node runtime.
+
 Release-only dependency installations and CI may set `AFL_ANDON_BUILD_ONLY=1`
 to skip user configuration and SSH checks in the **postinstall** hook. Built
 apps still perform setup on first launch. This is not a completed user
@@ -413,6 +427,14 @@ npm ci
 Remove-Item Env:AFL_ANDON_BUILD_ONLY
 npm run build
 ```
+
+GitHub builds installers for all three platforms on pull requests and pushes
+to `main`, storing them as Actions artifacts. Pushing a tag that matches
+`v` plus the version in `package.json` publishes those installers and
+`SHA256SUMS.txt` to a GitHub Release after all three builds succeed. See
+[Publishing a version tag](README.md#building) for the commands. Prerelease
+tags containing a hyphen are marked as prereleases. These installers are
+unsigned, and macOS builds are not notarized.
 
 ## Troubleshooting
 
