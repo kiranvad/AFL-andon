@@ -1,35 +1,61 @@
 name: Publish AppImage Release
 
 on:
-  push:
-    tags: ['v*']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release tag to build (for example, v1.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
-      - name: Validate release tag
-        run: node scripts/validate-release-tag.js
+      - name: Prepare release version
+        id: release
+        shell: bash
+        run: |
+          if [[ "$RELEASE_TAG" != v[0-9]* ]]; then
+            echo 'Use a version tag such as v1.1.0 or v1.1.0-beta.1.' >&2
+            exit 1
+          fi
+          release_version="${RELEASE_TAG#v}"
+          npm version "$release_version" --no-git-tag-version --ignore-scripts --allow-same-version
+          npm run check-package
+          node scripts/validate-release-tag.js
+          gh release view "$RELEASE_TAG" --json tagName --jq '.tagName'
+          printf 'tag=%s\nversion=%s\n' "$RELEASE_TAG" "$release_version" >> "$GITHUB_OUTPUT"
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   build:
     needs: validate
     uses: ./.github/workflows/build.yml
+    with:
+      ref: refs/tags/${{ needs.validate.outputs.tag }}
+      version: ${{ needs.validate.outputs.version }}
 
   release:
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -45,7 +71,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           shopt -s nullglob
           appimages=(*.AppImage)
@@ -55,8 +81,4 @@ jobs:
           fi
           sha256sum "${appimages[@]}" > SHA256SUMS.txt
 
-          options=(--verify-tag --generate-notes --title "$RELEASE_TAG")
-          if [[ "$RELEASE_TAG" == *-* ]]; then
-            options+=(--prerelease)
-          fi
-          gh release create "$RELEASE_TAG" "${appimages[@]}" SHA256SUMS.txt "${options[@]}"
+          gh release upload "$RELEASE_TAG" "${appimages[@]}" SHA256SUMS.txt --clobber
