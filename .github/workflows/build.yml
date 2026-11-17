@@ -1,4 +1,4 @@
-name: Build Installers
+name: Build Linux AppImage
 
 on:
   push:
@@ -11,10 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,24 +21,15 @@ jobs:
         env:
           AFL_ANDON_BUILD_ONLY: '1'
       - run: npm run check-package
-      - name: Build application
+      - name: Install AppImage build tools
         run: |
-          if [ "$RUNNER_OS" == "Windows" ]; then
-            npm run build:win -- --publish=never
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-            npm run build:mac -- --publish=never
-          else
-            sudo apt-get update
-            sudo apt-get install -y libarchive-tools
-            npm run build:linux -- --publish=never
-          fi
-        shell: bash
-      - name: Upload artifacts
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools
+      - name: Build AppImage
+        run: npm run build:linux -- --publish=never
+      - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ runner.os }}-artifacts
-          path: |
-            dist/*.AppImage
-            dist/*.dmg
-            dist/*.exe
+          name: Linux-AppImage
+          path: dist/*.AppImage
           if-no-files-found: error

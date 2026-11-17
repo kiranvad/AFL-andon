@@ -1,6 +1,6 @@
 # AFL Andon
 
-This Electron application provides a cross‑platform control panel for managing
+This Electron application provides a control panel for managing
 remote servers.  Each server is defined in a JSON configuration file.  The app
 can start, stop and restart screen sessions over SSH, display their current
 status and open their web interfaces.  A built‑in terminal allows joining a
@@ -94,9 +94,9 @@ running when Andon opened are not stopped.
 ## Installation
 
 Follow [INSTALL.md](INSTALL.md) for the step-by-step fresh-machine guide for
-Linux, macOS, and Windows. Start with **User installation**, including SSH key
-setup for your own account; **Developer and administrator setup** covers
-machine preparation with sudo or administrator access.
+Linux, the platform tested with this checkout. Start with **User installation**,
+including SSH key setup for your own account; **Developer and administrator
+setup** covers machine preparation with sudo or administrator access.
 
 After installing the prerequisites and enabling key-based localhost SSH:
 
@@ -419,24 +419,16 @@ second server type or launcher is needed.
 
 ## Building
 
-Builds for your current platform can be created with:
+Build a Linux AppImage with:
 
 ```bash
-npm run build
+npm run build:linux
 ```
 
-See `package.json` for platform-specific build scripts.
-
-The CI workflow produces installers for each OS:
-
-* macOS: DMG
-* Linux: AppImage
-* Windows: NSIS exe
-
-Pull requests and pushes to `main` make these installers available as GitHub
-Actions artifacts. Pushing a version tag such as `v1.0.1` runs the same builds
-and publishes the installers and `SHA256SUMS.txt` to a GitHub Release in the
-repository receiving the tag. All three platforms must build successfully.
+Pull requests and pushes to `main` build Linux AppImages and make them available
+as GitHub Actions artifacts. Pushing a version tag such as `v1.0.1` runs the same build
+and publishes the AppImages and `SHA256SUMS.txt` to a GitHub Release in the
+repository receiving the tag after the Linux build succeeds.
 Tags containing a hyphen, such as `v1.0.1-beta.1`, create prereleases.
 
 The tag must equal `v` followed by the version in `package.json`. To publish
@@ -455,4 +447,4 @@ git push origin v1.0.1
 Choose the next version for your release. The tagged commit must include
 `.github/workflows/release.yml`. These builds use Node.js 26.13.1 from `.nvmrc`
 and require no separate publishing token; the workflow uses `GITHUB_TOKEN`.
-The installers are unsigned; macOS builds are not notarized.
+The AppImages are unsigned.
