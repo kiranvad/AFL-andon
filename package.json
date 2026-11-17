@@ -1,6 +1,6 @@
 {
   "name": "AFL-andon",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "AFL server command app / Andon board",
   "main": "main.js",
   "scripts": {
