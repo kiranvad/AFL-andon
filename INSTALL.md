@@ -289,11 +289,12 @@ npm run build:linux
 ```
 
 GitHub builds Linux AppImages on pull requests and pushes to `main`, storing
-them as Actions artifacts. Pushing a tag that matches `v` plus the version in
-`package.json` publishes those AppImages and `SHA256SUMS.txt` to a GitHub Release
-after the Linux build succeeds. See [Publishing a version tag](README.md#building)
-for the commands. Prerelease tags containing a hyphen are marked as prereleases.
-These AppImages are unsigned.
+them as Actions artifacts. Publishing a GitHub Release or prerelease builds
+its tagged source and attaches AppImages and `SHA256SUMS.txt` to that release
+after the Linux build succeeds. The packaged version follows the release tag,
+such as `v1.1.0`; CI applies that version in its build checkout.
+See [Publishing an AppImage release](README.md#building) for publishing and
+manual rebuild instructions. These AppImages are unsigned.
 
 ## Troubleshooting
 

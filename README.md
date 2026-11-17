@@ -426,25 +426,25 @@ npm run build:linux
 ```
 
 Pull requests and pushes to `main` build Linux AppImages and make them available
-as GitHub Actions artifacts. Pushing a version tag such as `v1.0.1` runs the same build
-and publishes the AppImages and `SHA256SUMS.txt` to a GitHub Release in the
-repository receiving the tag after the Linux build succeeds.
-Tags containing a hyphen, such as `v1.0.1-beta.1`, create prereleases.
+as GitHub Actions artifacts. Publishing a GitHub Release runs the same build
+for that release's tag and attaches the AppImages and `SHA256SUMS.txt` to the
+existing release after the Linux build succeeds. Publishing a prerelease also
+runs this workflow.
 
-The tag must equal `v` followed by the version in `package.json`. To publish
-a new version, update and commit the version files first, then push the tag:
+Merge the release workflows into the repository's default branch and enable
+GitHub Actions before publishing. On GitHub, open **Releases**, choose
+**Draft a new release**, select a reviewed commit and a version tag such as
+`v1.1.0` or `v1.1.0-beta.1`, then publish the release to start the workflow.
 
-```bash
-npm version 1.0.1 --no-git-tag-version
-npm run check-package
-git add package.json package-lock.json
-git commit -m "Release 1.0.1"
-git push origin HEAD
-git tag v1.0.1
-git push origin v1.0.1
-```
+The packaged version comes from the release tag. For example, publishing
+`v1.1.0` produces version `1.1.0` even if the tagged source's `package.json`
+still says `1.0.0`. CI updates the package version and lockfile in its temporary
+build checkout.
 
-Choose the next version for your release. The tagged commit must include
-`.github/workflows/release.yml`. These builds use Node.js 26.13.1 from `.nvmrc`
-and require no separate publishing token; the workflow uses `GITHUB_TOKEN`.
-The AppImages are unsigned.
+For an already published release, open **Actions > Publish AppImage Release >
+Run workflow**, select the updated default branch, and enter its tag, such as
+`v1.1.0`. A manual run or rerun replaces AppImages and checksums with the same
+filenames on that release. This also recovers from an interrupted upload.
+
+These builds use Node.js 26.13.1 from `.nvmrc` and require no separate publishing
+token; the workflow uses `GITHUB_TOKEN`. The AppImages are unsigned.
